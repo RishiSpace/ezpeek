@@ -1,0 +1,15 @@
+[project]
+name = "ezpeek"
+version = "0.0.1"
+description = "Ultra-low latency GPU accelerated LAN remote desktop using FFmpeg + Qt"
+authors = [{ name = "Rishikesh Giridhar", email = "rishikesh.giridhar@outlook.com" }]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+
+dependencies = [
+    "PySide6",
+]
+
+[project.scripts]
+ezpeek = "ezpeek.cli:main"
