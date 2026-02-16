@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  stun-turn:
+    build: .
+    ports:
+      - "3478:3478/udp"
+      # Relay ports for TURN
+      - "49152-49252:49152-49252/udp"
+    environment:
+      - PUBLIC_IP=${PUBLIC_IP:-}
+    volumes:
+      # Mount credentials for TURN authentication
+      - ./credentials.json:/app/credentials.json:ro
+    command: >
+      --host 0.0.0.0
+      --port 3478
+      --turn
+      --realm ezpeek.io
+      --credentials /app/credentials.json
+    restart: unless-stopped
+    
+  # STUN-only mode (no authentication)
+  stun-only:
+    build: .
+    ports:
+      - "3479:3478/udp"
+    command: --host 0.0.0.0 --port 3478
+    restart: unless-stopped
+    profiles:
+      - stun-only
