@@ -2,7 +2,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout,
     QLabel, QListWidget, QListWidgetItem
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut  # <-- add
 
 from ...core.control import ControlClient
@@ -38,6 +38,11 @@ class MainWindow(QMainWindow):
             get_advertisement=self._my_advertisement,
         )
         self.discovery.start()
+
+        # Poll to detect if host proc died unexpectedly
+        self._hosting_poll = QTimer(self)
+        self._hosting_poll.timeout.connect(self._poll_hosting)
+        self._hosting_poll.start(2000)
 
     def setup_ui(self):
         central = QWidget()
@@ -188,6 +193,16 @@ class MainWindow(QMainWindow):
             msg = str(e).strip()
             first = msg.splitlines()[0] if msg else repr(e)
             self.status.setText(f"Status: Host failed: {first}. Check terminal output.")
+
+    def _poll_hosting(self):
+        if (self.host.state.proc is not None and
+                self.host.state.proc.poll() is not None):
+            self.host.state.proc = None
+            try:
+                self.host._stop_control()
+            except Exception:
+                pass
+            self.status.setText("Status: Hosting stopped (sender process died)")
 
     def closeEvent(self, event):
         try:

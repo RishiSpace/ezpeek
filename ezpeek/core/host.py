@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 
@@ -90,6 +91,11 @@ class HostService:
             self._stop_control()
             raise RuntimeError(self.state.last_error)
 
+        # Start monitor thread to detect if sender dies later
+        if not getattr(self, '_monitor_thread', None):
+            self._monitor_thread = threading.Thread(target=self._monitor_proc, daemon=True)
+            self._monitor_thread.start()
+
         return self.state
 
     def _stop_control(self):
@@ -100,6 +106,16 @@ class HostService:
                 pass
             self._control_server = None
         self.state.control_port = None
+
+    def _monitor_proc(self):
+        while self.state.proc:
+            if self.state.proc.poll() is not None:
+                if not self.state.last_error:
+                    self.state.last_error = "Sender process exited unexpectedly"
+                self.state.proc = None
+                self._stop_control()
+                break
+            time.sleep(1)
 
     def stop(self) -> None:
         p = self.state.proc

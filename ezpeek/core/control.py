@@ -72,7 +72,7 @@ class ControlServer:
             try:
                 self._sock.settimeout(1.0)
                 client, addr = self._sock.accept()
-                client.settimeout(10)
+                client.settimeout(300)  # 5 minutes idle timeout for control connection
                 self._clients.append(client)
                 t = threading.Thread(target=self._handle_client, args=(client, addr), daemon=True)
                 t.start()
@@ -86,20 +86,25 @@ class ControlServer:
         buf = b""
         try:
             while self._running:
-                data = client.recv(1024)
-                if not data:
+                try:
+                    data = client.recv(1024)
+                    if not data:
+                        break
+                    buf += data
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        msg = line.decode("utf-8", errors="ignore").strip()
+                        if msg:
+                            self._dispatch(msg)
+                            if self.on_event:
+                                try:
+                                    self.on_event(msg)
+                                except Exception:
+                                    pass
+                except TimeoutError:
+                    continue  # no data yet, keep waiting for input
+                except Exception:
                     break
-                buf += data
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    msg = line.decode("utf-8", errors="ignore").strip()
-                    if msg:
-                        self._dispatch(msg)
-                        if self.on_event:
-                            try:
-                                self.on_event(msg)
-                            except Exception:
-                                pass
         finally:
             try:
                 client.close()

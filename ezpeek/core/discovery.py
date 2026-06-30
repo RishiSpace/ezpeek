@@ -124,6 +124,9 @@ class DiscoveryService:
                 data, addr = self.sock.recvfrom(2048)
                 message = data.decode(errors="ignore")
 
+                if self.running:
+                    print(f"[ezpeek] Received discovery packet: {message} from {addr}")
+
                 if not message.startswith(MAGIC):
                     continue
 
@@ -164,5 +167,8 @@ class DiscoveryService:
                     if self.running:
                         print(f"[ezpeek] Discovered peer from network: {name} @ {ip} port={port}")
 
-            except:
-                break
+            except Exception:
+                if not self.running:
+                    break
+                time.sleep(0.1)
+                continue

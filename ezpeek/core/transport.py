@@ -200,14 +200,18 @@ def build_sender_cmd(capture: CaptureSpec, encode: EncodeSpec, tx: TransportSpec
                     pipeline = f"{wl_part} | {ffmpeg_exe} -hide_banner -loglevel warning -fflags nobuffer -flags low_delay -i - {encode_part} -f mpegts '{srt_url_str}'"
                     return ["sh", "-c", pipeline]
                 elif _has_gstreamer_pipewire():
-                    # Trigger portal grant (using our ScreenCast flow) so gst pipewiresrc can access the screen.
-                    # Then use gstreamer for capture (y4m carries resolution) piped to ffmpeg for (hw) encode + SRT.
+                    # Trigger portal grant and get node for specific capture.
+                    node_id = None
                     try:
                         from .capture import request_pipewire_node_id
-                        request_pipewire_node_id(app_id="ezpeek")  # may show permission dialog
+                        node_id = request_pipewire_node_id(app_id="ezpeek")
                     except Exception:
-                        pass  # proceed anyway; gst may still work or prompt
-                    gst = f"gst-launch-1.0 --quiet pipewiresrc do-timestamp=true ! videoconvert ! video/x-raw,framerate={fr}/1 ! y4menc ! fdsink fd=1"
+                        pass
+                    if node_id:
+                        src = f"pipewiresrc path={node_id} do-timestamp=true"
+                    else:
+                        src = "pipewiresrc do-timestamp=true"
+                    gst = f"gst-launch-1.0 --quiet {src} ! videoconvert ! video/x-raw,framerate={fr}/1 ! y4menc ! fdsink fd=1"
                     pipeline = f"{gst} | {ffmpeg_exe} -hide_banner -loglevel warning -fflags nobuffer -flags low_delay -f yuv4mpegpipe -i - {encode_part} -f mpegts '{srt_url_str}'"
                     return ["sh", "-c", pipeline]
         except Exception:
@@ -232,16 +236,46 @@ def build_sender_cmd(capture: CaptureSpec, encode: EncodeSpec, tx: TransportSpec
     return cmd
 
 
+def _get_supported_hwaccels() -> str:
+    """Query ffplay for list of supported hardware accelerators."""
+    try:
+        _, ffplay = _find_ffmpeg_executables()
+        p = subprocess.run([ffplay, "-hide_banner", "-hwaccels"],
+                           capture_output=True, text=True, check=False)
+        return (p.stdout or "") + (p.stderr or "")
+    except Exception:
+        return ""
+
+
 def _get_hwaccel_arg() -> list[str]:
-    """Return best-effort hwaccel flags for ffplay decode on current platform."""
+    """Return best-effort hwaccel flags for ffplay decode.
+    Falls back to software (no flag) if no supported HW accel is found.
+    """
+    txt = _get_supported_hwaccels().lower()
     sys_name = platform.system().lower()
+
     if sys_name == "windows":
-        # d3d11va or cuda if available; auto is safe
-        return ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
+        # Prefer d3d11va, then cuda, else software
+        if "d3d11va" in txt:
+            return ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
+        if "cuda" in txt:
+            return ["-hwaccel", "cuda"]
+        return []  # software decode
+
     elif sys_name == "linux":
-        # vaapi is excellent on Linux (intel/amd), cuda for nvidia
-        return ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
-    return ["-hwaccel", "auto"]
+        # vaapi first for intel/amd, cuda for nvidia, else software
+        if "vaapi" in txt:
+            return ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
+        if "cuda" in txt:
+            return ["-hwaccel", "cuda"]
+        if "vdpau" in txt:
+            return ["-hwaccel", "vdpau"]
+        return []  # software decode
+
+    # other platforms: try auto, which will fallback to software
+    if "auto" in txt or "none" in txt:
+        return ["-hwaccel", "auto"]
+    return []  # software
 
 
 def build_receiver_cmd(host: str, port: int, transport: Transport = "srt") -> list[str]:
