@@ -98,8 +98,20 @@ class MainWindow(QMainWindow):
         if ctrl_port:
             label += f" +ctrl"
 
+        data = {"ip": ip, "port": port, "ctrl": ctrl_port}
+
+        # Update existing item for this IP if present (allows port to appear when hosting starts)
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            existing = item.data(Qt.UserRole) or {}
+            if existing.get("ip") == ip:
+                item.setText(label)
+                item.setData(Qt.UserRole, data)
+                return
+
+        # New peer
         item = QListWidgetItem(label)
-        item.setData(Qt.UserRole, {"ip": ip, "port": port, "ctrl": ctrl_port})
+        item.setData(Qt.UserRole, data)
         self.list_widget.addItem(item)
 
     def _connect_to_selected(self, item: QListWidgetItem):
@@ -109,7 +121,7 @@ class MainWindow(QMainWindow):
         ctrl = data.get("ctrl")
 
         if not ip or not port:
-            self.status.setText("Status: Peer did not advertise a port (start hosting on the other device).")
+            self.status.setText("Status: Peer did not advertise a port yet (start hosting on the other device and wait a few seconds).")
             return
 
         # Stop previous
@@ -152,10 +164,21 @@ class MainWindow(QMainWindow):
             if self.host.state.proc and self.host.state.proc.poll() is None:
                 self.host.stop()
                 self.status.setText("Status: Not hosting")
+                if hasattr(self, 'discovery') and self.discovery:
+                    try:
+                        self.discovery.force_broadcast()
+                    except Exception:
+                        pass
             else:
                 st = self.host.start()
                 ctrl = f" +ctrl:{st.control_port}" if getattr(st, "control_port", None) else ""
                 self.status.setText(f"Status: Hosting on {st.host_ip}:{st.port}{ctrl}")
+                # Immediately announce the new port to peers
+                if hasattr(self, 'discovery') and self.discovery:
+                    try:
+                        self.discovery.force_broadcast()
+                    except Exception:
+                        pass
         except Exception as e:
             import traceback
             # Always log full error to terminal for debugging (esp. Wayland setup)

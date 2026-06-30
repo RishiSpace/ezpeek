@@ -5,6 +5,19 @@ import time
 from ezpeek.utils import get_local_ip
 
 
+def _get_subnet_broadcast(ip: str) -> str:
+    """Best-effort /24 broadcast for the given IP (common for home/LAN routers)."""
+    if not ip or ip == "0.0.0.0":
+        return None
+    try:
+        parts = ip.split(".")
+        if len(parts) == 4:
+            return f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+    except Exception:
+        pass
+    return None
+
+
 BROADCAST_PORT = 52525
 MAGIC = "EZPEEK_HELLO"
 
@@ -25,6 +38,10 @@ class DiscoveryService:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
         self.sock.bind(("", BROADCAST_PORT))
 
     def start(self):
@@ -37,6 +54,34 @@ class DiscoveryService:
         try:
             self.sock.close()
         except:
+            pass
+
+    def force_broadcast(self):
+        """Immediately send one discovery packet (useful after hosting state change)."""
+        if not self.running:
+            return
+        adv = {}
+        try:
+            if self.get_advertisement:
+                adv = dict(self.get_advertisement() or {})
+        except Exception:
+            adv = {}
+        video_port = adv.get("port") or adv.get("video_port") or ""
+        ctrl = adv.get("ctrl") or adv.get("control_port") or ""
+        message = f"{MAGIC}|{socket.gethostname()}|{self._my_ip}|{video_port}|{ctrl}"
+        try:
+            msg = message.encode()
+            dests = ["<broadcast>", "255.255.255.255"]
+            bcast = _get_subnet_broadcast(self._my_ip)
+            if bcast:
+                dests.append(bcast)
+            for bcast_addr in set(dests):
+                try:
+                    self.sock.sendto(msg, (bcast_addr, BROADCAST_PORT))
+                except Exception:
+                    pass
+            print(f"[ezpeek] Discovery force broadcast: {message}")
+        except Exception:
             pass
 
     def _broadcaster(self):
@@ -56,7 +101,19 @@ class DiscoveryService:
             # MAGIC|hostname|ip|video_port|ctrl_port
             message = f"{MAGIC}|{hostname}|{self._my_ip}|{video_port}|{ctrl}"
             try:
-                self.sock.sendto(message.encode(), ("<broadcast>", BROADCAST_PORT))
+                msg = message.encode()
+                # Try common broadcast addresses for better compatibility across OS/VMs/routers
+                dests = ["<broadcast>", "255.255.255.255"]
+                bcast = _get_subnet_broadcast(self._my_ip)
+                if bcast:
+                    dests.append(bcast)
+                for bcast_addr in set(dests):
+                    try:
+                        self.sock.sendto(msg, (bcast_addr, BROADCAST_PORT))
+                    except Exception:
+                        pass
+                if self.running:
+                    print(f"[ezpeek] Discovery broadcast sent: {message}")
             except Exception:
                 pass
             time.sleep(2)
@@ -76,6 +133,8 @@ class DiscoveryService:
                 #   MAGIC|hostname|ip|video_port|ctrl_port
                 name = parts[1] if len(parts) > 1 else "Unknown"
                 ip = parts[2] if len(parts) > 2 else addr[0]
+                if ip in ("0.0.0.0", "", None):
+                    ip = addr[0]
                 port_str = parts[3] if len(parts) > 3 else ""
                 port = int(port_str) if port_str.isdigit() else None
 
@@ -102,6 +161,8 @@ class DiscoveryService:
                     except TypeError:
                         # Older callback signature
                         self.on_peer_found(name, ip, port)
+                    if self.running:
+                        print(f"[ezpeek] Discovered peer from network: {name} @ {ip} port={port}")
 
             except:
                 break
