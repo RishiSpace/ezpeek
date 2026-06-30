@@ -13,7 +13,7 @@ class DiscoveryService:
     def __init__(self, on_peer_found=None, get_advertisement=None):
         """
         on_peer_found: callback(name, ip, port|None)
-        get_advertisement: callable returning dict-like info to broadcast (e.g. {"port": 17000})
+        get_advertisement: callable returning dict-like info to broadcast (e.g. {"port": 2734})
         """
         self.on_peer_found = on_peer_found
         self.get_advertisement = get_advertisement
@@ -50,9 +50,11 @@ class DiscoveryService:
             except Exception:
                 adv = {}
 
-            port = adv.get("port", "")
-            # MAGIC|hostname|ip|port
-            message = f"{MAGIC}|{hostname}|{self._my_ip}|{port}"
+            # Support richer advertisement: {"port": video_port, "ctrl": control_port, ...}
+            video_port = adv.get("port") or adv.get("video_port") or ""
+            ctrl = adv.get("ctrl") or adv.get("control_port") or ""
+            # MAGIC|hostname|ip|video_port|ctrl_port
+            message = f"{MAGIC}|{hostname}|{self._my_ip}|{video_port}|{ctrl}"
             try:
                 self.sock.sendto(message.encode(), ("<broadcast>", BROADCAST_PORT))
             except Exception:
@@ -69,12 +71,18 @@ class DiscoveryService:
                     continue
 
                 parts = message.split("|")
-                # Old format: MAGIC|hostname
-                # New format: MAGIC|hostname|ip|port
+                # Formats:
+                #   MAGIC|hostname|ip|video_port
+                #   MAGIC|hostname|ip|video_port|ctrl_port
                 name = parts[1] if len(parts) > 1 else "Unknown"
                 ip = parts[2] if len(parts) > 2 else addr[0]
                 port_str = parts[3] if len(parts) > 3 else ""
                 port = int(port_str) if port_str.isdigit() else None
+
+                ctrl_port = None
+                if len(parts) > 4:
+                    cstr = parts[4]
+                    ctrl_port = int(cstr) if cstr.isdigit() else None
 
                 # Skip self
                 if ip == self._my_ip:
@@ -86,7 +94,14 @@ class DiscoveryService:
                 self._seen.add(key)
 
                 if self.on_peer_found:
-                    self.on_peer_found(name, ip, port)
+                    # Pass extra metadata via a small wrapper or by convention (ip, video_port, ctrl_port)
+                    # Keep backward compat: existing callers receive (name, ip, port)
+                    # We attach ctrl via item data later in GUI
+                    try:
+                        self.on_peer_found(name, ip, port, ctrl_port=ctrl_port)
+                    except TypeError:
+                        # Older callback signature
+                        self.on_peer_found(name, ip, port)
 
             except:
                 break

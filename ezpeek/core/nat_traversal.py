@@ -171,7 +171,7 @@ def get_best_connection_address(
         if not info:
             # Fallback to local
             from ezpeek.utils import get_local_ip
-            return (get_local_ip(), local_port or 17000, "local")
+            return (get_local_ip(), local_port or 2734, "local")
 
         # Check if we need TURN (symmetric NAT)
         if config and config.turn_server and info.connection_type == "stun":
@@ -223,7 +223,7 @@ def gather_ice_candidates(
         if local_ip != "0.0.0.0":
             candidates.append(IceCandidate(
                 ip=local_ip,
-                port=local_port or 17000,
+                port=local_port or 2734,
                 candidate_type="host",
                 priority=100,
             ))

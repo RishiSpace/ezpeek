@@ -26,10 +26,15 @@ class ViewerService:
         if not p:
             return
         if p.poll() is None:
-            p.terminate()
             try:
-                p.wait(timeout=3.0)
+                p.terminate()
+                p.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
-                p.kill()
-                p.wait(timeout=3.0)
+                try:
+                    p.kill()
+                    p.wait(timeout=2.0)
+                except Exception:
+                    pass
+            except Exception:
+                pass
         self.state.proc = None

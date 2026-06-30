@@ -5,6 +5,8 @@ from .encoder import EncodeSpec, build_video_encode_args, pick_hw_encoder
 from .host import HostService, HostState
 from .transport import TransportSpec, build_sender_cmd, build_receiver_cmd
 from .viewer import ViewerService, ViewerState
+from .input_controller import InputController
+from .control import ControlServer, ControlClient
 from .stun_turn import (
     StunClient,
     TurnClient,
@@ -42,6 +44,10 @@ __all__ = [
     # Viewer
     "ViewerService",
     "ViewerState",
+    # Input / Control (for remoting)
+    "InputController",
+    "ControlServer",
+    "ControlClient",
     # STUN/TURN
     "StunClient",
     "TurnClient",

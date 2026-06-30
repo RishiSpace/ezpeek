@@ -5,9 +5,11 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence, QShortcut  # <-- add
 
+from ...core.control import ControlClient
 from ...core.discovery import DiscoveryService
 from ...core.host import HostService
 from ...core.viewer import ViewerService
+from .viewer_window import ViewerWindow
 
 
 class MainWindow(QMainWindow):
@@ -20,6 +22,10 @@ class MainWindow(QMainWindow):
         # Services
         self.host = HostService()          # not started by default
         self.viewer = ViewerService()      # started on-demand
+        self.control = ControlClient()     # for sending input to remote host
+
+        self._current_peer: dict = {}      # {ip, port, ctrl}
+        self.viewer_win: ViewerWindow | None = None
 
         self.setup_ui()
 
@@ -41,7 +47,7 @@ class MainWindow(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size: 24px; color: white;")
 
-        hint = QLabel("Tip: Press 'H' to toggle hosting. Double-click a device to view it (if it advertises a port).")
+        hint = QLabel("Tip: Press 'H' to toggle hosting. Double-click a device to view (video + control if advertised). Enable Grab Input in the viewer window.")
         hint.setAlignment(Qt.AlignCenter)
         hint.setStyleSheet("color: #bbbbbb;")
 
@@ -76,39 +82,68 @@ class MainWindow(QMainWindow):
         """)
 
     def _my_advertisement(self):
-        # If hosting, advertise the actual port; else advertise empty
+        # If hosting, advertise video port + control port for full remoting
         if self.host.state.proc and self.host.state.proc.poll() is None:
-            return {"port": self.host.state.port}
+            adv = {"port": self.host.state.port}
+            if self.host.state.control_port:
+                adv["ctrl"] = self.host.state.control_port
+            return adv
         return {}
 
-    def add_peer(self, name, ip, port):
-        # Store connection metadata in the item for double-click connect
+    def add_peer(self, name, ip, port, ctrl_port=None):
+        # Store connection metadata (video + optional control)
         label = f"{name}  —  {ip}"
         if port:
-            label += f"  (port {port})"
+            label += f"  (video {port})"
+        if ctrl_port:
+            label += f" +ctrl"
 
         item = QListWidgetItem(label)
-        item.setData(Qt.UserRole, {"ip": ip, "port": port})
+        item.setData(Qt.UserRole, {"ip": ip, "port": port, "ctrl": ctrl_port})
         self.list_widget.addItem(item)
 
     def _connect_to_selected(self, item: QListWidgetItem):
         data = item.data(Qt.UserRole) or {}
         ip = data.get("ip")
         port = data.get("port")
+        ctrl = data.get("ctrl")
 
         if not ip or not port:
             self.status.setText("Status: Peer did not advertise a port (start hosting on the other device).")
             return
 
-        # Stop current viewer then start
+        # Stop previous
         try:
             self.viewer.stop()
         except Exception:
             pass
+        try:
+            self.control.close()
+        except Exception:
+            pass
+
+        self._current_peer = {"ip": ip, "port": port, "ctrl": ctrl}
 
         try:
             self.viewer.start(ip, int(port))
-            self.status.setText(f"Status: Viewing {ip}:{port}")
+            # Connect control channel if peer advertised one (enables input remoting)
+            if ctrl:
+                if self.control.connect(ip, int(ctrl)):
+                    self.status.setText(f"Status: Viewing {ip}:{port} (control ready)")
+                else:
+                    self.status.setText(f"Status: Viewing {ip}:{port} (no control)")
+            else:
+                self.status.setText(f"Status: Viewing {ip}:{port} (no ctrl advertised)")
+
+            # Open integrated viewer window (for input grabbing + status)
+            if self.viewer_win:
+                try:
+                    self.viewer_win.close()
+                except Exception:
+                    pass
+            self.viewer_win = ViewerWindow(ip, int(port), int(ctrl) if ctrl else None)
+            self.viewer_win.show()
+            self.viewer_win.raise_()
         except Exception as e:
             self.status.setText(f"Status: Failed to start viewer: {e}")
 
@@ -119,19 +154,17 @@ class MainWindow(QMainWindow):
                 self.status.setText("Status: Not hosting")
             else:
                 st = self.host.start()
-                self.status.setText(f"Status: Hosting on {st.host_ip}:{st.port}")
+                ctrl = f" +ctrl:{st.control_port}" if getattr(st, "control_port", None) else ""
+                self.status.setText(f"Status: Hosting on {st.host_ip}:{st.port}{ctrl}")
         except Exception as e:
-            # show the most useful part
-            msg = str(e).strip().splitlines()[-1] if str(e).strip() else repr(e)
-            self.status.setText(f"Status: Host failed: {msg}")
-
-    # Keep keyPressEvent if you want, but it's no longer required:
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_H:
-            self.toggle_hosting()
-            event.accept()
-            return
-        super().keyPressEvent(event)
+            import traceback
+            # Always log full error to terminal for debugging (esp. Wayland setup)
+            print("Host start failed:")
+            traceback.print_exc()
+            # Show concise in UI
+            msg = str(e).strip()
+            first = msg.splitlines()[0] if msg else repr(e)
+            self.status.setText(f"Status: Host failed: {first}. Check terminal output.")
 
     def closeEvent(self, event):
         try:
@@ -146,4 +179,13 @@ class MainWindow(QMainWindow):
             self.host.stop()
         except Exception:
             pass
+        try:
+            self.control.close()
+        except Exception:
+            pass
+        if self.viewer_win:
+            try:
+                self.viewer_win.close()
+            except Exception:
+                pass
         super().closeEvent(event)

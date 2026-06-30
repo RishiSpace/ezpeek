@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import platform
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -37,13 +38,37 @@ def _ffmpeg_encoders_text() -> str:
 def pick_hw_encoder(codec: VideoCodec) -> Optional[str]:
     """
     Pick a hardware encoder if available in the installed ffmpeg build.
-    Priority: NVENC > QSV > VAAPI > AMF
+    Platform-aware priority for best performance / compatibility:
+      - Windows: NVENC > AMF > QSV
+      - Linux: VAAPI > NVENC > QSV > AMF
+      - Fallback generic order
     """
     txt = _ffmpeg_encoders_text()
+    sys_name = platform.system().lower()
+
     if codec == "h264":
-        cands = ["h264_nvenc", "h264_qsv", "h264_vaapi", "h264_amf"]
+        base = ["h264_nvenc", "h264_amf", "h264_qsv", "h264_vaapi"]
     else:
-        cands = ["hevc_nvenc", "hevc_qsv", "hevc_vaapi", "hevc_amf"]
+        base = ["hevc_nvenc", "hevc_amf", "hevc_qsv", "hevc_vaapi"]
+
+    # Reorder by platform preference
+    if sys_name == "windows":
+        order = ["nvenc", "amf", "qsv", "vaapi"]
+    elif sys_name == "linux":
+        order = ["vaapi", "nvenc", "qsv", "amf"]
+    else:
+        order = ["nvenc", "amf", "qsv", "vaapi"]
+
+    cands = []
+    for pref in order:
+        for c in base:
+            if pref in c and c not in cands:
+                cands.append(c)
+    # add any remaining
+    for c in base:
+        if c not in cands:
+            cands.append(c)
+
     for enc in cands:
         if enc in txt:
             return enc

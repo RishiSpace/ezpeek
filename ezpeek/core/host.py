@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import random
 import subprocess
 import time
 from dataclasses import dataclass
 
 from ezpeek.utils import get_local_ip
 from .capture import CaptureSpec
+from .control import ControlServer
 from .encoder import EncodeSpec
+from .nat_traversal import get_best_connection_address
 from .transport import TransportSpec, build_sender_cmd
 
 
@@ -16,15 +17,22 @@ class HostState:
     host_ip: str
     port: int
     proc: subprocess.Popen | None = None
+    control_port: int | None = None
     last_error: str = ""
 
 
 class HostService:
-    def __init__(self, fps: int = 60, bitrate_kbps: int = 12000, codec: str = "h264", port: int | None = None):
+    DEFAULT_PORT = 2734
+    DEFAULT_CONTROL_PORT = 2735
+
+    def __init__(self, fps: int = 60, bitrate_kbps: int = 12000, codec: str = "h264", port: int | None = None, enable_control: bool = True, use_nat: bool = False):
         self.fps = fps
         self.bitrate_kbps = bitrate_kbps
         self.codec = codec
-        self.port = port or random.randint(15000, 25000)
+        self.port = port or self.DEFAULT_PORT
+        self.enable_control = enable_control
+        self.use_nat = use_nat
+        self._control_server: ControlServer | None = None
         self.state = HostState(host_ip=get_local_ip(), port=self.port)
 
     def start(self) -> HostState:
@@ -32,6 +40,18 @@ class HostService:
             return self.state
 
         self.state.last_error = ""
+
+        # Optional NAT: discover public address for advertisement (viewer will try public IP)
+        if self.use_nat:
+            try:
+                ip, prt, ctype = get_best_connection_address(local_port=self.port)
+                if ip and ip != "0.0.0.0":
+                    self.state.host_ip = ip
+                    if prt:
+                        self.port = prt
+                    print(f"[ezpeek] NAT: advertising {ctype} address {ip}:{self.port}")
+            except Exception as e:
+                print(f"[ezpeek] NAT discovery failed (using local): {e}")
 
         capture = CaptureSpec(fps=self.fps)
         encode = EncodeSpec(codec=self.codec, fps=self.fps, bitrate_kbps=self.bitrate_kbps, gop=self.fps)  # type: ignore[arg-type]
@@ -46,8 +66,18 @@ class HostService:
             bufsize=1,
         )
 
+        # Start control server (for input remoting)
+        if self.enable_control:
+            try:
+                self._control_server = ControlServer(host=self.state.host_ip, port=self.DEFAULT_CONTROL_PORT)
+                ctrl_port = self._control_server.start()
+                self.state.control_port = ctrl_port
+            except Exception as e:
+                print(f"[ezpeek] Warning: could not start control server: {e}")
+                self.state.control_port = None
+
         # Give ffmpeg a moment; if it exits immediately, grab output
-        time.sleep(0.25)
+        time.sleep(0.3)
         if self.state.proc.poll() is not None:
             out = ""
             try:
@@ -56,19 +86,39 @@ class HostService:
             except Exception:
                 out = ""
             self.state.last_error = out.strip()[-1200:] if out else "ffmpeg exited immediately (no output captured)"
+            # cleanup control
+            self._stop_control()
             raise RuntimeError(self.state.last_error)
 
         return self.state
 
+    def _stop_control(self):
+        if self._control_server:
+            try:
+                self._control_server.stop()
+            except Exception:
+                pass
+            self._control_server = None
+        self.state.control_port = None
+
     def stop(self) -> None:
         p = self.state.proc
-        if not p:
-            return
-        if p.poll() is None:
-            p.terminate()
+        if p and p.poll() is None:
             try:
-                p.wait(timeout=3.0)
+                p.terminate()
+                p.wait(timeout=2.5)
             except subprocess.TimeoutExpired:
-                p.kill()
-                p.wait(timeout=3.0)
+                # More forceful cross platform
+                try:
+                    if hasattr(p, "kill"):
+                        p.kill()
+                    else:
+                        p.terminate()
+                    p.wait(timeout=2)
+                except Exception:
+                    pass
+            except Exception:
+                pass
         self.state.proc = None
+
+        self._stop_control()
