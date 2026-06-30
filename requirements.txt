@@ -1,0 +1,10 @@
+# Runtime dependencies for ezpeek
+# Install with: pip install -r requirements.txt
+# Note: Some dependencies are Linux-only (for Wayland screen capture and input)
+
+PySide6>=6.5
+zeroconf>=0.80
+
+# Linux-specific dependencies (Wayland portal + dbus for screen sharing/input)
+dbus-python>=1.3.2; platform_system == "Linux"
+PyGObject>=3.42; platform_system == "Linux"
