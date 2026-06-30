@@ -21,9 +21,8 @@ class EncodeSpec:
 
 
 def _ffmpeg() -> str:
-    path = shutil.which("ffmpeg")
-    if not path:
-        raise RuntimeError("ffmpeg not found on PATH")
+    from .transport import _find_ffmpeg_executables
+    path, _ = _find_ffmpeg_executables()
     return path
 
 
