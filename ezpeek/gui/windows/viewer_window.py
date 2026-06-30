@@ -1,15 +1,15 @@
 """
 ViewerWindow - dedicated window for viewing a remote desktop + forwarding input.
 
-Current design (practical for production):
-- Spawns / manages the ffplay video window (external but excellent HW decode + low latency).
-- Provides Qt controls for input grabbing.
-- When "Grab Input" is active, this window captures mouse + keyboard (setFocus + mouse tracking) and forwards via ControlClient.
-- Coordinates: simple mapping; user can resize/position the video separately.
-- Future improvement: could switch to fully integrated video rendering (QOpenGL + ffmpeg frames or libmpv).
+Current design:
+- The video is launched externally via ViewerService (ffplay for best HW decode + low latency).
+- This window provides controls for input grabbing (mouse/keyboard forwarding).
+- When "Grab Input" is active, this window captures events and sends them over the control channel.
+- The separate ffplay window can be positioned/resized independently.
 
-Usage from MainWindow or CLI:
-    w = ViewerWindow(ip, video_port, control_port)
+Usage from MainWindow:
+    # main_window already does viewer.start(...) then:
+    w = ViewerWindow(ip, video_port, ctrl_port)
     w.show()
 """
 
@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QCheckBox, QSpinBox
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeyEvent, QMouseEvent, QWheelEvent
 
 from ...core.control import ControlClient
@@ -47,17 +47,14 @@ class ViewerWindow(QMainWindow):
             else:
                 self.status_label.setText("Control connect failed (input disabled)")
 
-        # Optional: auto open ffplay hint
-        self._video_hint_timer = QTimer(self)
-        self._video_hint_timer.setSingleShot(True)
-        self._video_hint_timer.timeout.connect(self._show_video_hint)
-        self._video_hint_timer.start(400)
+        # Note: The video is launched externally by the caller via ViewerService (ffplay).
+        # We just provide the control surface here.
 
     def _setup_ui(self):
         central = QWidget()
         layout = QVBoxLayout(central)
 
-        self.status_label = QLabel("Ready. Double-click or use controls below to manage session.")
+        self.status_label = QLabel("Video launched externally in ffplay (for best performance).\nEnable 'Grab Input' below to control the remote from this window.")
         self.status_label.setAlignment(Qt.AlignCenter)
 
         # Controls
@@ -79,8 +76,8 @@ class ViewerWindow(QMainWindow):
 
         # Info / instructions
         info = QLabel(
-            "Video plays in ffplay (external). Bring this window forward and enable 'Grab Input' to forward events.\n"
-            "Tip: Click inside this window after enabling grab. Press ESC to release grab."
+            "The actual video appears in a separate ffplay window (external for low latency + hardware decode).\n"
+            "Use this window to grab and forward input. Click inside after enabling grab. ESC to release."
         )
         info.setStyleSheet("color:#888; font-size:11px;")
         info.setWordWrap(True)
@@ -109,12 +106,6 @@ class ViewerWindow(QMainWindow):
             except Exception:
                 pass
             self.status_label.setText("Input released.")
-
-    def _show_video_hint(self):
-        self.status_label.setText(
-            f"Start video with: ffplay -fflags nobuffer -flags low_delay "
-            f"srt://{self.host_ip}:{self.video_port}?mode=caller&latency=20"
-        )
 
     # ---- Input forwarding ----
     def mouseMoveEvent(self, event: QMouseEvent):
