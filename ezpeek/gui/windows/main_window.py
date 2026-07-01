@@ -141,6 +141,7 @@ class MainWindow(QMainWindow):
 
         self._current_peer = {"ip": ip, "port": port, "ctrl": ctrl}
 
+        print(f"[ezpeek] _connect_to_selected -> ip={ip} port={port} ctrl={ctrl}")
         try:
             self.viewer.start(ip, int(port))
             # Connect control channel if peer advertised one (enables input remoting)
@@ -161,7 +162,11 @@ class MainWindow(QMainWindow):
             self.viewer_win = ViewerWindow(ip, int(port), int(ctrl) if ctrl else None)
             self.viewer_win.show()
             self.viewer_win.raise_()
+            print(f"[ezpeek] ViewerWindow shown for {ip}:{port}. External ffplay should have been launched by ViewerService.")
         except Exception as e:
+            import traceback
+            print("[ezpeek] Exception in _connect_to_selected / viewer.start:")
+            traceback.print_exc()
             self.status.setText(f"Status: Failed to start viewer: {e}")
 
     def toggle_hosting(self) -> None:

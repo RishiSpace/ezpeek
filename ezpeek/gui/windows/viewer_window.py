@@ -54,7 +54,7 @@ class ViewerWindow(QMainWindow):
         central = QWidget()
         layout = QVBoxLayout(central)
 
-        self.status_label = QLabel("Video launched externally in ffplay (for best performance).\nEnable 'Grab Input' below to control the remote from this window.")
+        self.status_label = QLabel("Video launched externally in ffplay (for best performance).\nEnable 'Grab Input' below to control the remote from this window.\n\n[DEBUG] Check your terminal for [ezpeek viewer] logs (command, ffplay path, exit codes).")
         self.status_label.setAlignment(Qt.AlignCenter)
 
         # Controls
@@ -77,7 +77,8 @@ class ViewerWindow(QMainWindow):
         # Info / instructions
         info = QLabel(
             "The actual video appears in a separate ffplay window (external for low latency + hardware decode).\n"
-            "Use this window to grab and forward input. Click inside after enabling grab. ESC to release."
+            "Use this window to grab and forward input. Click inside after enabling grab. ESC to release.\n"
+            "If no ffplay window appears, look at the console where you launched ezpeek for debug logs."
         )
         info.setStyleSheet("color:#888; font-size:11px;")
         info.setWordWrap(True)

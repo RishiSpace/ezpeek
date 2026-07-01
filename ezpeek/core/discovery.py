@@ -18,7 +18,7 @@ def _get_subnet_broadcast(ip: str) -> str:
     return None
 
 
-BROADCAST_PORT = 52525
+BROADCAST_PORT = 27787
 MAGIC = "EZPEEK_HELLO"
 
 

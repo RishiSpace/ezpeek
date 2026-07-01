@@ -60,12 +60,14 @@ def _find_ffmpeg_executables() -> tuple[str, str]:
     ffmpeg = shutil.which("ffmpeg")
     ffplay = shutil.which("ffplay")
     if ffmpeg and ffplay:
+        print(f"[ezpeek ffmpeg] Found in PATH: ffmpeg={ffmpeg}, ffplay={ffplay}")
         _FFMPEG_CACHE = ffmpeg
         _FFPLAY_CACHE = ffplay
         return ffmpeg, ffplay
 
     # 2. Check our local portable installation
     ffmpeg_dir = _get_ffmpeg_dir()
+    print(f"[ezpeek ffmpeg] No PATH ffplay, checking portable dir: {ffmpeg_dir}")
     if platform.system().lower() == "windows":
         candidates = list(ffmpeg_dir.rglob("ffmpeg.exe"))
         ffplay_candidates = list(ffmpeg_dir.rglob("ffplay.exe"))
@@ -76,6 +78,7 @@ def _find_ffmpeg_executables() -> tuple[str, str]:
     if candidates and ffplay_candidates:
         _FFMPEG_CACHE = str(candidates[0])
         _FFPLAY_CACHE = str(ffplay_candidates[0])
+        print(f"[ezpeek ffmpeg] Using portable: {_FFMPEG_CACHE}, {_FFPLAY_CACHE}")
         return _FFMPEG_CACHE, _FFPLAY_CACHE
 
     # 3. Not found anywhere -> download portable build
@@ -109,6 +112,7 @@ def _find_ffmpeg_executables() -> tuple[str, str]:
         ffplay_candidates = list(ffmpeg_dir.rglob("ffplay"))
 
     if not candidates or not ffplay_candidates:
+        print("[ezpeek ffmpeg] Download succeeded but no ffmpeg/ffplay binaries found in archive!")
         raise RuntimeError("Failed to download FFmpeg. Please install it manually.")
 
     # Make Linux binaries executable
@@ -118,14 +122,17 @@ def _find_ffmpeg_executables() -> tuple[str, str]:
 
     _FFMPEG_CACHE = str(candidates[0])
     _FFPLAY_CACHE = str(ffplay_candidates[0])
-    print(f"[ezpeek] Portable FFmpeg installed to {_FFMPEG_CACHE}")
+    print(f"[ezpeek] Portable FFmpeg installed to {_FFMPEG_CACHE} and {_FFPLAY_CACHE}")
     return _FFMPEG_CACHE, _FFPLAY_CACHE
 
 
 def ensure_ffmpeg_tools() -> None:
+    print("[ezpeek ffmpeg] ensure_ffmpeg_tools() called")
     try:
-        _find_ffmpeg_executables()
+        ffmpeg, ffplay = _find_ffmpeg_executables()
+        print(f"[ezpeek ffmpeg] ensure_ffmpeg_tools success -> ffmpeg={ffmpeg}, ffplay={ffplay}")
     except Exception as e:
+        print(f"[ezpeek ffmpeg] ensure_ffmpeg_tools EXCEPTION: {repr(e)}")
         # Fallback to helpful error if auto-download also fails
         system = platform.system().lower()
         if system == "windows":
@@ -211,7 +218,17 @@ def build_sender_cmd(capture: CaptureSpec, encode: EncodeSpec, tx: TransportSpec
                         src = f"pipewiresrc path={node_id} do-timestamp=true"
                     else:
                         src = "pipewiresrc do-timestamp=true"
-                    gst = f"gst-launch-1.0 --quiet {src} ! videoconvert ! video/x-raw,framerate={fr}/1 ! y4menc ! fdsink fd=1"
+                    # More robust pipeline for pipewiresrc negotiation:
+                    # - videorate before forcing framerate caps
+                    # - extra queue + explicit negotiation order
+                    # - avoid strict framerate on the raw caps before rate conversion
+                    gst = (
+                        f"gst-launch-1.0 "
+                        f"{src} ! queue max-size-buffers=4 leaky=downstream ! "
+                        f"videoconvert ! "
+                        f"videorate ! video/x-raw,format=I420,framerate={fr}/1 ! "
+                        f"y4menc ! queue ! fdsink fd=1"
+                    )
                     pipeline = f"{gst} | {ffmpeg_exe} -hide_banner -loglevel warning -fflags nobuffer -flags low_delay -f yuv4mpegpipe -i - {encode_part} -f mpegts '{srt_url_str}'"
                     return ["sh", "-c", pipeline]
         except Exception:
@@ -279,8 +296,10 @@ def _get_hwaccel_arg() -> list[str]:
 
 
 def build_receiver_cmd(host: str, port: int, transport: Transport = "srt") -> list[str]:
+    print(f"[ezpeek viewer] build_receiver_cmd called for {host}:{port}")
     ensure_ffmpeg_tools()
     _, ffplay_exe = _find_ffmpeg_executables()
+    print(f"[ezpeek viewer] Using ffplay executable: {ffplay_exe}")
     if transport != "srt":
         raise RuntimeError(f"Unsupported transport: {transport}")
 
@@ -297,5 +316,8 @@ def build_receiver_cmd(host: str, port: int, transport: Transport = "srt") -> li
         "-fast",
     ]
     cmd += hw
-    cmd += [srt_url(host, port, mode="caller", latency_ms=20, extra="rcvlatency=10")]
+    srt = srt_url(host, port, mode="caller", latency_ms=20, extra="rcvlatency=10")
+    cmd += [srt]
+    print(f"[ezpeek viewer] Full ffplay command: {cmd}")
+    print(f"[ezpeek viewer] SRT URL: {srt}")
     return cmd

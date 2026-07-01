@@ -86,7 +86,9 @@ def _has_wl_screenrec() -> bool:
 
 
 def _has_gstreamer_pipewire() -> bool:
-    """Check if GStreamer has pipewiresrc element."""
+    """Check if GStreamer has pipewiresrc element and gst-launch-1.0 is available."""
+    if shutil.which("gst-launch-1.0") is None:
+        return False
     try:
         p = subprocess.run(
             ["gst-inspect-1.0", "pipewiresrc"],

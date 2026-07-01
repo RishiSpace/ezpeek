@@ -59,6 +59,8 @@ class HostService:
         tx = TransportSpec(transport="srt", host=self.state.host_ip, port=self.state.port)
 
         cmd = build_sender_cmd(capture, encode, tx)
+        print(f"[ezpeek host] build_sender_cmd returned. Launching sender ffmpeg...")
+        print(f"[ezpeek host] sender cmd (first 8 elems + last): {cmd[:8] + ['...'] + cmd[-1:]}")
         self.state.proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -66,6 +68,7 @@ class HostService:
             text=True,
             bufsize=1,
         )
+        print(f"[ezpeek host] Sender ffmpeg Popen pid={self.state.proc.pid}")
 
         # Start control server (for input remoting)
         if self.enable_control:
@@ -73,6 +76,7 @@ class HostService:
                 self._control_server = ControlServer(host=self.state.host_ip, port=self.DEFAULT_CONTROL_PORT)
                 ctrl_port = self._control_server.start()
                 self.state.control_port = ctrl_port
+                print(f"[ezpeek host] Control server started on port {ctrl_port}")
             except Exception as e:
                 print(f"[ezpeek] Warning: could not start control server: {e}")
                 self.state.control_port = None
@@ -87,6 +91,7 @@ class HostService:
             except Exception:
                 out = ""
             self.state.last_error = out.strip()[-1200:] if out else "ffmpeg exited immediately (no output captured)"
+            print(f"[ezpeek host] Sender ffmpeg died early! last_error={self.state.last_error[:300]}")
             # cleanup control
             self._stop_control()
             raise RuntimeError(self.state.last_error)
