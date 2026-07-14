@@ -1,117 +1,216 @@
 # ezpeek
 
-**LAN / NAT-friendly remote desktop with hardware-accelerated capture + encode + smooth low-latency streaming (FFmpeg + SRT + Qt).**
+**LAN remote desktop** with hardware-accelerated capture + encode and low-latency streaming (**FFmpeg + SRT + Qt**), plus optional **cloud auth / friends / reverse-proxy** via a separate server.
 
-Production-oriented focus: excellent cross-platform capture (especially **Linux Wayland** ↔ **Windows**), hardware acceleration on both encode and decode, and real input remoting.
+Cross-platform focus: **Linux Wayland** and **Windows**, with real mouse/keyboard remoting and an integrated viewer.
+
+**Version:** 0.2.0
+
+---
+
+## Current status
+
+| Area | Status |
+|------|--------|
+| **Same-LAN remoting** | Working — discovery, SRT video, TCP control, integrated Qt viewer |
+| **Linux Wayland host** | Working — xdg-desktop-portal + PipeWire capture; RemoteDesktop portal for input |
+| **Linux X11 host** | Legacy path retained for pure X11 sessions |
+| **Windows host / view** | Working — gdigrab/d3d11grab where available; SendInput for control |
+| **Codecs** | **Auto:** probe real HW **AV1**, else HW/soft **H.264**. Default **CBR ~25 Mbps**. Stream FPS follows min(host refresh, client refresh) |
+| **Cloud auth + friends** | Working — login/register UI; server URL saved locally (no hardcoded default) |
+| **Cloud TCP relay** | Working — host & viewer dial out; server pairs control streams ([ezpeek-svr](https://github.com/RishiSpace/ezpeek-svr)) |
+| **Video over internet** | Prefer LAN SRT when peers share a network; full internet video path still evolving (STUN/TURN helpers live under `server/`) |
+
+---
 
 ## Features
-- **Capture**:
-  - Linux: X11 + Wayland (PipeWire via portals) with excellent fallbacks.
-  - Windows: gdigrab + d3d11grab (when available in FFmpeg) for lower overhead.
-- **HW Acceleration**:
-  - Auto-detects NVENC, AMF, QSV, VAAPI per platform.
-  - Viewer uses ffplay with platform HW decode where possible.
-- **Transport**: SRT (low latency, reliable).
-- **Input Remoting**: Full mouse + keyboard forwarding (Windows native via SendInput; Linux via xdotool).
-- **Discovery**: Simple LAN broadcast (works without mDNS).
-- **NAT**: Optional STUN-based public address advertisement.
-- **GUI**: Qt (PySide6) with integrated ViewerWindow for input grab.
+
+- **Capture**
+  - Linux: Wayland (PipeWire via portals); X11 for legacy sessions
+  - Windows: gdigrab + d3d11grab when FFmpeg supports them
+- **HW acceleration** — probes NVENC / AMF / QSV / VAAPI; falls back to libx264
+- **Transport** — SRT (low latency, reliable) on UDP
+- **Input remoting** — mouse + keyboard (Windows SendInput; Linux portal or xdotool fallback)
+- **LAN discovery** — UDP broadcast (no mDNS required)
+- **GUI** — PySide6: login → main window → integrated viewer with input grab
+- **Cloud (optional)** — accounts, friends list, presence, reverse-proxy rendezvous
+
+---
+
+## Cloud server → [ezpeek-svr](https://github.com/RishiSpace/ezpeek-svr)
+
+**Server-level hosting** (auth, friends, presence, TCP relay) is provided by the **[ezpeek-svr](https://github.com/RishiSpace/ezpeek-svr)** repository — not this client tree.
+
+| | |
+|---|---|
+| **Repo** | https://github.com/RishiSpace/ezpeek-svr |
+| **API** | TCP **8787** (HTTP: register/login/friends/presence) |
+| **Relay** | TCP **8788** (host ↔ viewer pairing) |
+
+Deploy that service on a VPS (or LAN box), open **8787/tcp** and **8788/tcp**, then point the ezpeek client at `http://YOUR_HOST:8787` on the sign-in screen. The URL is stored in `~/.config/ezpeek/settings.json` (Windows: under the user’s config path).
+
+A copy of the cloud package and a **STUN/TURN** helper also live under [`server/`](server/) in this repo for local reference / optional NAT tooling. **Production cloud hosting should use [ezpeek-svr](https://github.com/RishiSpace/ezpeek-svr).**
+
+---
 
 ## Requirements
-- Python >= 3.10
-- FFmpeg (with SRT support strongly recommended) + ffplay on PATH
-- PySide6
-- Linux only: `dbus-python`, `PyGObject` (for Wayland portal)
-- (Recommended) `xdotool` on Linux for input
 
-## Quick Start (Phase 1 — same LAN, no cloud server)
+### Runtime
+- **Python ≥ 3.10**
+- **FFmpeg + ffplay** on `PATH` (SRT strongly recommended; PipeWire input for Linux Wayland hosts)
+- **PySide6**, **zeroconf** (installed via pip)
+- Linux: **dbus-python**, **PyGObject** (Wayland portals)
+- Linux hosting: **xdg-desktop-portal** + backend (GNOME/KDE/wlr), **PipeWire** + wireplumber
+- Linux (optional): **xdotool** for X11 / portal fallback input
+
+### Install FFmpeg + ffplay
+
+| Platform | Typical install |
+|----------|-----------------|
+| **Windows** | `winget install ffmpeg` (prefer full build), or Scoop/Chocolatey full packages, or [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) full zip + PATH |
+| **Debian / Ubuntu / …** | `sudo apt install ffmpeg` |
+| **Fedora** | Enable [RPM Fusion](https://rpmfusion.org/), then `sudo dnf swap ffmpeg-free ffmpeg --allowerasing` (or `dnf install ffmpeg`) |
+| **Arch / Manjaro / …** | `sudo pacman -S ffmpeg` |
+
+Verify:
 
 ```bash
-# Install in editable mode
+ffmpeg -version
+ffplay -version
+ffmpeg -protocols 2>/dev/null | grep -i srt
+```
+
+---
+
+## Ports
+
+### Same LAN (open on host; both sides if strict)
+
+| Port | Proto | Role |
+|------|--------|------|
+| **27787** | UDP | Peer discovery |
+| **2734** | UDP | Video (SRT) |
+| **2735** | TCP | Control / input |
+
+### Cloud client (outbound only)
+
+| Port | Proto | Role |
+|------|--------|------|
+| **8787** | TCP | API |
+| **8788** | TCP | Relay |
+
+### Optional STUN/TURN server (if you run one)
+
+| Port | Proto | Role |
+|------|--------|------|
+| **3478** | UDP | STUN/TURN |
+| **49152–65535** | UDP | TURN relay range (when TURN enabled) |
+
+---
+
+## Quick start (LAN — no cloud)
+
+```bash
+# Install client
 pip install -e .
 
-# Verify this machine can stream + control (no second PC needed)
+# Prove SRT + control on this machine (no second PC, no screen share)
 ezpeek self-test
 
-# Run GUI
+# GUI
 ezpeek
-# Host without screen capture (synthetic pattern — useful for debugging):
+
+# Host synthetic pattern (debug — no capture permissions)
 ezpeek --test-pattern
 ```
 
 ### Two-machine checklist
-1. **Same network** (or same hypervisor LAN / bridged VM).
-2. Install on both machines (`pip install -e .`), FFmpeg with **SRT** + **ffplay** on PATH (or let ezpeek auto-download).
-3. **Firewall** (both sides): allow  
-   - UDP **27787** (discovery)  
-   - UDP **2734** (video / SRT)  
-   - TCP **2735** (control / input)
-4. Machine A: run `ezpeek` → press **H** (Linux Wayland: accept the screen-share portal). Status should show `HOSTING … ip:2734 ctrl:2735`.
-5. Machine B: wait until A appears with **video 2734** (not “not hosting”) → **double-click**.
-6. One **integrated viewer** opens: remote screen + mouse/keyboard. Enable **Grab Input** (ESC to release).
+1. Same network (LAN, bridged VMs, etc.).
+2. Install client + FFmpeg/ffplay (SRT) on both machines.
+3. Allow **UDP 27787**, **UDP 2734**, **TCP 2735**.
+4. Machine A: `ezpeek` → **H** / Start Hosting (Wayland: accept screen-share portal). Status: `HOSTING … :2734` / ctrl **2735**.
+5. Machine B: wait until A shows **video 2734** → **double-click**.
+6. Viewer: enable **Grab Input** (ESC to release).
 
-**Codec:** auto-selects **hardware AV1** when encode actually works on the host GPU; otherwise **H.264** (HW if available, else libx264). Viewer decodes with ffmpeg (HW accel when available).
+**Codec:** auto HW AV1 when the encoder actually works on the GPU; otherwise H.264 (HW if available, else libx264). **CBR ~25 Mbps.** Stream FPS adapts to host and client display refresh.
 
-Logs: `~/.cache/ezpeek/logs/` (Linux) or `%LOCALAPPDATA%\ezpeek\logs\` (Windows).
+**Logs:** `~/.cache/ezpeek/logs/` (Linux) or `%LOCALAPPDATA%\ezpeek\logs\` (Windows).
 
-In GUI:
-1. On machine A press **H** (or **Start Hosting**) to start **hosting**.
-2. On machine B the peer appears with video ports — double-click to view.
-3. In the viewer enable **Grab Input** to control the remote from the same window.
+---
 
-## Configuration / Advanced
-HostService supports:
-- `fps`, `bitrate_kbps`, `codec`
+## Quick start (with cloud friends)
+
+1. Deploy **[ezpeek-svr](https://github.com/RishiSpace/ezpeek-svr)** and open **8787** + **8788**.
+2. On each client, run `ezpeek` → enter **Server URL** (e.g. `http://YOUR_HOST:8787`) → register / log in.
+3. Add friends by username; host and connect via the friends / presence UI when available on LAN, or use the relay for control rendezvous.
+
+---
+
+## Platform notes
+
+### Wayland (default on modern Linux)
+- Capture: xdg-desktop-portal + PipeWire via FFmpeg.
+- Input: RemoteDesktop portal (one-time permission); xdotool only as fallback / X11.
+- Needs FFmpeg with PipeWire support when hosting. If capture fails, try a fuller build (e.g. AUR `ffmpeg-full` / OBS-oriented builds).
+- GUI runs natively on Wayland.
+
+### Windows
+- Prefer a **full** FFmpeg build (SRT + modern capture).
+- HW encode (NVENC/AMF/…) auto-selected when probes succeed.
+- Input via SendInput (normal user session is enough).
+
+---
+
+## Configuration / advanced
+
+`HostService` supports (among others):
+- `fps`, `bitrate_kbps`, `codec` (`auto` / `av1` / `h264` / `hevc`)
 - `enable_control=True`
-- `use_nat=True` (advertises STUN public address when possible)
+- `use_nat=True` (STUN public address advertisement when possible)
+- `test_pattern=True` (synthetic source)
 
-SRT latency is tuned low (~20ms target).
+Client settings / session files live under the user config dir (`~/.config/ezpeek/` on Linux).
 
-### Wayland Native Support (recommended and default)
-ezpeek is designed for pure Wayland (the mainstream on modern Linux).
+SRT latency is tuned for low delay (~20 ms target range; exact values in transport code).
 
-Research (2025-2026):
-- Ubuntu 25.10 removed the X11/GNOME session entirely.
-- Ubuntu 26.04 LTS ships Wayland-only.
-- GNOME 49+ and recent KDE Plasma are dropping or have dropped X11 session support.
-- X11 is in maintenance-only mode with known long-standing vulnerabilities.
-- XWayland remains only for running old X11 apps inside Wayland.
+---
 
-We have removed all X11 capture/input fallbacks for Wayland hosts.
+## Architecture
 
-- Capture uses xdg-desktop-portal + PipeWire for native, permissioned, low-overhead screen capture via FFmpeg.
-- Input uses the RemoteDesktop portal (user grants "remote control" permission once).
-- No dependency on X11, x11grab, or xdotool for Wayland hosts.
-- Requirements: FFmpeg with PipeWire support + xdg-desktop-portal + wireplumber.
-- If your FFmpeg lacks PipeWire, install a properly built one (e.g. ffmpeg-obs on Arch) or wl-screenrec.
-- The GUI (PySide6) runs natively on Wayland.
-- ffplay for viewing also works on Wayland.
+```
+[Host]  capture → FFmpeg encode (AV1/H.264 CBR) → SRT listen :2734
+        ControlServer TCP :2735  ← mouse/keyboard
 
-See capture.py and wayland_portal.py for implementation. X11 paths are retained only for legacy X11 sessions.
+[Viewer] FFmpeg decode (SRT caller) → Qt ViewerWindow
+         ControlClient → TCP :2735
 
-### Windows Notes
-- Modern FFmpeg builds support d3d11grab for better capture.
-- HW encode (NVENC/AMF) is auto-picked.
-- Input uses native SendInput (no extra privileges usually needed for user session).
+[Optional cloud]  ezpeek-svr  :8787 API  +  :8788 TCP relay
+```
 
-## Architecture Highlights
-- Video path stays with FFmpeg (best HW accel + low latency).
-- Separate lightweight TCP control channel for input.
-- Modular: `core/capture`, `encoder`, `transport`, `control`, `nat_traversal`, etc.
+Modules: `ezpeek/core/{capture,encoder,transport,control,discovery,host,viewer,…}`, `ezpeek/gui/`, `ezpeek/cloud/`.
 
-## Production Notes
-- Robust process lifecycle (terminate + kill).
-- Graceful fallbacks and clear error messages.
-- Version 0.2.0 — focused on compatibility and remoting completeness.
-- For internet use: combine with the included STUN/TURN server or port-forward + `use_nat`.
-
-See `server/` for the bundled STUN/TURN implementation.
+---
 
 ## Development
+
 ```bash
 pip install -e ".[dev]"
 ruff check .
 pytest
+ezpeek self-test
 ```
 
-Contributions and issues welcome. The goal is reliable, smooth, hardware-accelerated remoting across Linux Wayland and Windows.
+---
+
+## Related repos
+
+| Repo | Role |
+|------|------|
+| **[ezpeek](https://github.com/RishiSpace/ezpeek)** (this) | Client: LAN remoting + GUI + cloud client |
+| **[ezpeek-svr](https://github.com/RishiSpace/ezpeek-svr)** | **Server hosting:** auth, friends, presence, TCP relay |
+
+## License
+
+See [LICENSE](LICENSE).
+
+Contributions and issues welcome. Goal: reliable, smooth, hardware-accelerated remoting across Linux Wayland and Windows — with optional cloud identity when you need friends across networks.
