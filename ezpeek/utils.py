@@ -9,10 +9,12 @@ from pathlib import Path
 from typing import Optional
 
 
-# Stream quality bounds (kbps). Encoders use VBR/CBR-with-cap inside this range.
-BITRATE_MIN_KBPS = 20000
-BITRATE_MAX_KBPS = 30000
-BITRATE_TARGET_KBPS = 25000  # preferred average; clamped into [min, max]
+# Stream bitrate (kbps). Constant CBR for predictable quality.
+BITRATE_CBR_KBPS = 25000
+# Back-compat aliases used by host/GUI
+BITRATE_MIN_KBPS = BITRATE_CBR_KBPS
+BITRATE_MAX_KBPS = BITRATE_CBR_KBPS
+BITRATE_TARGET_KBPS = BITRATE_CBR_KBPS
 
 # Practical stream FPS clamps (some panels report odd floats)
 FPS_MIN = 24

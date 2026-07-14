@@ -91,7 +91,7 @@ class HostService:
         )
         print(
             f"[ezpeek host] Local display refresh ≈ {self.host_hz:.2f} Hz → "
-            f"initial stream {self.fps} fps, VBR {self.bitrate_min_kbps}-{self.bitrate_max_kbps} kbps"
+            f"initial stream {self.fps} fps, CBR {self.bitrate_kbps} kbps"
         )
 
     def _start_screencast_if_needed(self) -> Optional[int]:

@@ -80,7 +80,7 @@ class MainWindow(QMainWindow):
             "Video + mouse/keyboard share one window (Grab Input) · "
             f"This display ≈ {self.local_hz:.0f} Hz · "
             f"stream FPS = min(host, viewer) · "
-            f"VBR {BITRATE_MIN_KBPS//1000}-{BITRATE_MAX_KBPS//1000} Mbps · "
+            f"CBR {BITRATE_TARGET_KBPS//1000} Mbps · "
             f"{describe_encode_choice(EncodeSpec(codec='auto', fps=int(self.local_hz), bitrate_kbps=BITRATE_TARGET_KBPS, bitrate_min_kbps=BITRATE_MIN_KBPS, bitrate_max_kbps=BITRATE_MAX_KBPS))}"
         )
         hint.setAlignment(Qt.AlignCenter)
