@@ -1,11 +1,15 @@
 """
-ViewerWindow - control surface for a remote session.
+Integrated ViewerWindow — remote video + mouse/keyboard in one surface.
 
-Video is launched externally via ViewerService (ffplay).
-This window owns the TCP control channel and optional input grab.
+Video is decoded by ffmpeg (SRT → MJPEG pipe) and painted in a Qt widget.
+Input events on that widget are forwarded over the TCP control channel.
 """
 
 from __future__ import annotations
+
+import subprocess
+import threading
+from typing import Optional
 
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -15,179 +19,239 @@ from PySide6.QtWidgets import (
     QPushButton,
     QLabel,
     QCheckBox,
+    QSizePolicy,
 )
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeyEvent, QMouseEvent, QWheelEvent
+from PySide6.QtCore import Qt, Signal, QObject, QThread, Slot
+from PySide6.QtGui import (
+    QImage,
+    QPixmap,
+    QKeyEvent,
+    QMouseEvent,
+    QWheelEvent,
+    QPainter,
+    QCursor,
+)
 
 from ...core.control import ControlClient
+from ...core.viewer import build_integrated_decode_cmd
 
 
-class ViewerWindow(QMainWindow):
-    def __init__(
-        self,
-        host_ip: str,
-        video_port: int,
-        ctrl_port: int | None = None,
-        parent=None,
-    ):
+class _MjpegReader(QObject):
+    """Background reader: ffmpeg stdout (MJPEG) → QImage signals."""
+
+    frame = Signal(QImage)
+    failed = Signal(str)
+    started_ok = Signal()
+
+    def __init__(self, cmd: list[str], parent=None):
         super().__init__(parent)
-        self.host_ip = host_ip
-        self.video_port = video_port
-        self.ctrl_port = ctrl_port
+        self._cmd = cmd
+        self._proc: Optional[subprocess.Popen] = None
+        self._stop = threading.Event()
 
-        self.setWindowTitle(f"EzPeek Control — {host_ip}:{video_port}")
-        self.setMinimumSize(720, 420)
-
-        self.control = ControlClient()
-        self.control_connected = False
-        self._grab_input = False
-
-        self._setup_ui()
-
-        if ctrl_port:
-            self.control_connected = self.control.connect(host_ip, int(ctrl_port), timeout=4.0, retries=4)
-            if self.control_connected:
-                self.status_label.setText(
-                    f"Control connected to {host_ip}:{ctrl_port}\n"
-                    f"Video: separate ffplay window 'EzPeek Video - {host_ip}:{video_port}'\n"
-                    "Enable Grab Input to forward mouse/keyboard."
-                )
-            else:
-                self.status_label.setText(
-                    f"Control connect FAILED to {host_ip}:{ctrl_port}\n"
-                    f"Video may still work in ffplay.\n"
-                    f"Check host firewall (TCP {ctrl_port}) and that host is still hosting."
-                )
-        else:
-            self.status_label.setText(
-                "No control port advertised. Video only (if ffplay window appeared)."
+    @Slot()
+    def run(self):
+        try:
+            self._proc = subprocess.Popen(
+                self._cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
             )
-
-    def _setup_ui(self):
-        central = QWidget()
-        layout = QVBoxLayout(central)
-
-        self.status_label = QLabel("Connecting…")
-        self.status_label.setAlignment(Qt.AlignCenter)
-        self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("color: #ddd; font-size: 13px;")
-
-        ctrl_layout = QHBoxLayout()
-
-        self.grab_cb = QCheckBox("Grab Input (send mouse/keyboard)")
-        self.grab_cb.stateChanged.connect(self._toggle_grab)
-
-        self.btn_ping = QPushButton("Ping Control")
-        self.btn_ping.clicked.connect(self._ping)
-
-        self.btn_reconnect = QPushButton("Reconnect Control")
-        self.btn_reconnect.clicked.connect(self._reconnect)
-
-        self.btn_stop = QPushButton("Close")
-        self.btn_stop.clicked.connect(self.close)
-
-        ctrl_layout.addWidget(self.grab_cb)
-        ctrl_layout.addStretch()
-        ctrl_layout.addWidget(self.btn_ping)
-        ctrl_layout.addWidget(self.btn_reconnect)
-        ctrl_layout.addWidget(self.btn_stop)
-
-        info = QLabel(
-            "Video appears in a separate ffplay window (best latency + HW decode).\n"
-            "This window is only for remote input. ESC releases grab.\n"
-            "If no video window: check terminal logs and ~/.cache/ezpeek/logs (Linux) "
-            "or %LOCALAPPDATA%\\ezpeek\\logs (Windows)."
-        )
-        info.setStyleSheet("color:#888; font-size:11px;")
-        info.setWordWrap(True)
-
-        layout.addWidget(self.status_label)
-        layout.addLayout(ctrl_layout)
-        layout.addWidget(info)
-
-        self.setCentralWidget(central)
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.setMouseTracking(True)
-
-    def _ping(self):
-        if self.control.send("PING"):
-            self.status_label.setText(self.status_label.text().split("\n")[0] + "\nPing sent OK")
-        else:
-            self.status_label.setText("Ping failed — control not connected")
-
-    def _reconnect(self):
-        if not self.ctrl_port:
-            self.status_label.setText("No control port to reconnect")
+        except Exception as e:
+            self.failed.emit(f"Failed to start decoder: {e}")
             return
-        self.control_connected = self.control.connect(
-            self.host_ip, int(self.ctrl_port), timeout=4.0, retries=4
-        )
-        if self.control_connected:
-            self.status_label.setText(f"Control reconnected to {self.host_ip}:{self.ctrl_port}")
-        else:
-            self.status_label.setText(f"Reconnect failed to {self.host_ip}:{self.ctrl_port}")
 
-    def _toggle_grab(self, state: int):
-        self._grab_input = bool(state)
-        if self._grab_input:
-            if not self.control_connected:
-                self.status_label.setText("Cannot grab — control is not connected")
-                self.grab_cb.setChecked(False)
-                self._grab_input = False
-                return
-            self.grabMouse()
-            self.setFocus()
-            self.status_label.setText("Input GRABBED — mouse & keys forwarded. ESC to release.")
-        else:
+        self.started_ok.emit()
+        assert self._proc.stdout is not None
+        buf = bytearray()
+        # Drain stderr in a side thread so the pipe cannot fill up
+        err_chunks: list[bytes] = []
+
+        def _drain_err():
             try:
-                self.releaseMouse()
+                assert self._proc and self._proc.stderr
+                while not self._stop.is_set():
+                    chunk = self._proc.stderr.read(512)
+                    if not chunk:
+                        break
+                    err_chunks.append(chunk)
+                    if sum(len(c) for c in err_chunks) > 64_000:
+                        del err_chunks[:-20]
             except Exception:
                 pass
-            self.status_label.setText("Input released.")
+
+        t = threading.Thread(target=_drain_err, daemon=True)
+        t.start()
+
+        SOI = b"\xff\xd8"
+        EOI = b"\xff\xd9"
+
+        try:
+            while not self._stop.is_set():
+                chunk = self._proc.stdout.read(4096)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+
+                while True:
+                    start = buf.find(SOI)
+                    if start < 0:
+                        # keep tail in case SOI is split
+                        if len(buf) > 2:
+                            del buf[:-2]
+                        break
+                    if start > 0:
+                        del buf[:start]
+                    end = buf.find(EOI, 2)
+                    if end < 0:
+                        break
+                    end += 2
+                    jpeg = bytes(buf[:end])
+                    del buf[:end]
+                    img = QImage.fromData(jpeg, "JPEG")
+                    if not img.isNull():
+                        self.frame.emit(img)
+
+                # prevent unbounded growth if stream is garbage
+                if len(buf) > 8_000_000:
+                    buf.clear()
+        except Exception as e:
+            if not self._stop.is_set():
+                self.failed.emit(str(e))
+        finally:
+            self._stop.set()
+            if self._proc and self._proc.poll() is None:
+                try:
+                    self._proc.terminate()
+                    self._proc.wait(timeout=1.5)
+                except Exception:
+                    try:
+                        self._proc.kill()
+                    except Exception:
+                        pass
+            err = b"".join(err_chunks).decode(errors="ignore").strip()
+            if self._proc and self._proc.returncode not in (0, None, -15, 255):
+                # -15 = SIGTERM on some platforms
+                msg = err[-800:] if err else f"decoder exit {self._proc.returncode}"
+                self.failed.emit(msg)
+
+    def stop(self):
+        self._stop.set()
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+
+
+class VideoSurface(QWidget):
+    """Paints the remote frame and optionally captures input."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pixmap: Optional[QPixmap] = None
+        self._frame_w = 0
+        self._frame_h = 0
+        self.grab_input = False
+        self.control: Optional[ControlClient] = None
+        self.setMinimumSize(640, 360)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setStyleSheet("background: #000;")
+        self.setCursor(Qt.ArrowCursor)
+
+    def set_frame(self, image: QImage):
+        self._frame_w = image.width()
+        self._frame_h = image.height()
+        self._pixmap = QPixmap.fromImage(image)
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.fillRect(self.rect(), Qt.black)
+        if not self._pixmap or self._pixmap.isNull():
+            p.setPen(Qt.gray)
+            p.drawText(self.rect(), Qt.AlignCenter, "Connecting to stream…")
+            return
+        # Letterbox scale
+        scaled = self._pixmap.scaled(
+            self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        x = (self.width() - scaled.width()) // 2
+        y = (self.height() - scaled.height()) // 2
+        p.drawPixmap(x, y, scaled)
+        self._draw_rect = (x, y, scaled.width(), scaled.height())
+
+    def _map_to_remote(self, pos) -> Optional[tuple[int, int]]:
+        if not self._frame_w or not self._frame_h:
+            return None
+        if not hasattr(self, "_draw_rect"):
+            return None
+        x0, y0, dw, dh = self._draw_rect
+        if dw <= 0 or dh <= 0:
+            return None
+        lx = pos.x() - x0
+        ly = pos.y() - y0
+        if lx < 0 or ly < 0 or lx > dw or ly > dh:
+            return None
+        rx = int(lx * self._frame_w / dw)
+        ry = int(ly * self._frame_h / dh)
+        rx = max(0, min(self._frame_w - 1, rx))
+        ry = max(0, min(self._frame_h - 1, ry))
+        return rx, ry
 
     def mouseMoveEvent(self, event: QMouseEvent):
-        if self._grab_input and self.ctrl_port:
-            pos = event.position()
-            self.control.mouse_move(int(pos.x()), int(pos.y()))
+        if self.grab_input and self.control and self.control.connected:
+            mapped = self._map_to_remote(event.position())
+            if mapped:
+                self.control.mouse_move(mapped[0], mapped[1])
         super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent):
-        if self._grab_input and self.ctrl_port:
-            self.control.mouse_click(self._qt_button_to_num(event.button()), down=True)
+        if self.grab_input and self.control and self.control.connected:
+            btn = self._qt_button(event.button())
+            self.control.mouse_click(btn, down=True)
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
-        if self._grab_input and self.ctrl_port:
-            self.control.mouse_click(self._qt_button_to_num(event.button()), down=False)
+        if self.grab_input and self.control and self.control.connected:
+            btn = self._qt_button(event.button())
+            self.control.mouse_click(btn, down=False)
         super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event: QWheelEvent):
-        if self._grab_input and self.ctrl_port:
+        if self.grab_input and self.control and self.control.connected:
             delta = event.angleDelta().y() // 120
             if delta:
                 self.control.mouse_wheel(int(delta))
         super().wheelEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent):
-        if self._grab_input and self.ctrl_port:
-            if event.key() == Qt.Key_Escape:
-                self.grab_cb.setChecked(False)
-                return
-            key = self._qt_key_to_name(event)
+        if event.key() == Qt.Key_Escape and self.grab_input:
+            # Parent window handles un-grab via signal-less callback
+            w = self.window()
+            if hasattr(w, "release_grab"):
+                w.release_grab()  # type: ignore[attr-defined]
+            return
+        if self.grab_input and self.control and self.control.connected:
+            key = self._qt_key(event)
             if key:
                 self.control.key(key, down=True)
-        else:
-            super().keyPressEvent(event)
+            return
+        super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event: QKeyEvent):
-        if self._grab_input and self.ctrl_port:
-            key = self._qt_key_to_name(event)
+        if self.grab_input and self.control and self.control.connected:
+            key = self._qt_key(event)
             if key:
                 self.control.key(key, down=False)
-        else:
-            super().keyReleaseEvent(event)
+            return
+        super().keyReleaseEvent(event)
 
-    def _qt_button_to_num(self, qt_btn) -> int:
+    @staticmethod
+    def _qt_button(qt_btn) -> int:
         if qt_btn == Qt.LeftButton:
             return 1
         if qt_btn == Qt.RightButton:
@@ -196,7 +260,8 @@ class ViewerWindow(QMainWindow):
             return 2
         return 1
 
-    def _qt_key_to_name(self, ev: QKeyEvent) -> str:
+    @staticmethod
+    def _qt_key(ev: QKeyEvent) -> str:
         key = ev.key()
         text = ev.text()
         special = {
@@ -225,13 +290,164 @@ class ViewerWindow(QMainWindow):
             return special[key]
         if text and len(text) == 1:
             return text.lower()
-        return ev.text().lower() or "space"
+        return text.lower() if text else ""
 
-    def closeEvent(self, event):
+
+class ViewerWindow(QMainWindow):
+    def __init__(
+        self,
+        host_ip: str,
+        video_port: int,
+        ctrl_port: int | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.host_ip = host_ip
+        self.video_port = video_port
+        self.ctrl_port = ctrl_port
+
+        self.setWindowTitle(f"EzPeek — {host_ip}:{video_port}")
+        self.setMinimumSize(960, 540)
+        self.resize(1280, 720)
+
+        self.control = ControlClient()
+        self.control_connected = False
+        self._thread: Optional[QThread] = None
+        self._reader: Optional[_MjpegReader] = None
+
+        self._build_ui()
+        self._connect_control()
+        self._start_video()
+
+    def _build_ui(self):
+        central = QWidget()
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        self.surface = VideoSurface()
+        self.surface.control = self.control
+        layout.addWidget(self.surface, stretch=1)
+
+        bar = QHBoxLayout()
+        self.status_label = QLabel("Starting…")
+        self.status_label.setStyleSheet("color: #ccc;")
+        self.grab_cb = QCheckBox("Grab Input (mouse & keyboard → remote)")
+        self.grab_cb.stateChanged.connect(self._toggle_grab)
+        self.btn_fullscreen = QPushButton("Fullscreen")
+        self.btn_fullscreen.clicked.connect(self._toggle_fullscreen)
+        self.btn_close = QPushButton("Close")
+        self.btn_close.clicked.connect(self.close)
+        bar.addWidget(self.grab_cb)
+        bar.addStretch()
+        bar.addWidget(self.status_label)
+        bar.addWidget(self.btn_fullscreen)
+        bar.addWidget(self.btn_close)
+        layout.addLayout(bar)
+
+        tip = QLabel("Tip: enable Grab Input, then click the video. ESC releases grab. Scroll/keys go to the host.")
+        tip.setStyleSheet("color:#777; font-size:11px;")
+        layout.addWidget(tip)
+
+        self.setCentralWidget(central)
+        self.setStyleSheet("QMainWindow { background: #111; } QPushButton { padding: 6px 12px; }")
+
+    def _connect_control(self):
+        if not self.ctrl_port:
+            self.status_label.setText("Video only (no control port advertised)")
+            return
+        self.control_connected = self.control.connect(
+            self.host_ip, int(self.ctrl_port), timeout=4.0, retries=4
+        )
+        if self.control_connected:
+            self.status_label.setText(f"Control OK → {self.host_ip}:{self.ctrl_port}")
+        else:
+            self.status_label.setText(
+                f"Control failed ({self.host_ip}:{self.ctrl_port}) — video may still work"
+            )
+
+    def _start_video(self):
         try:
-            self.releaseMouse()
+            cmd = build_integrated_decode_cmd(self.host_ip, int(self.video_port))
+        except Exception as e:
+            self.status_label.setText(f"Decoder setup failed: {e}")
+            return
+
+        self._thread = QThread(self)
+        self._reader = _MjpegReader(cmd)
+        self._reader.moveToThread(self._thread)
+        self._thread.started.connect(self._reader.run)
+        self._reader.frame.connect(self._on_frame)
+        self._reader.failed.connect(self._on_decode_fail)
+        self._reader.started_ok.connect(
+            lambda: self.status_label.setText(
+                self.status_label.text() + " · decoding…"
+                if "Control" in self.status_label.text()
+                else "Decoding stream…"
+            )
+        )
+        self._thread.start()
+
+    @Slot(QImage)
+    def _on_frame(self, img: QImage):
+        self.surface.set_frame(img)
+        if "Decoding" in self.status_label.text() or "decoding" in self.status_label.text():
+            ctrl = " · input ready" if self.control_connected else ""
+            self.status_label.setText(
+                f"Live {img.width()}x{img.height()} from {self.host_ip}:{self.video_port}{ctrl}"
+            )
+
+    @Slot(str)
+    def _on_decode_fail(self, msg: str):
+        self.status_label.setText(f"Video error: {msg[:200]}")
+        print(f"[ezpeek viewer] decode failed: {msg}")
+
+    def _toggle_grab(self, state: int):
+        on = bool(state)
+        if on and not self.control_connected:
+            self.grab_cb.setChecked(False)
+            self.status_label.setText("Cannot grab — control channel not connected")
+            return
+        self.surface.grab_input = on
+        if on:
+            self.surface.grabMouse()
+            self.surface.setFocus()
+            self.surface.setCursor(Qt.BlankCursor)
+            self.status_label.setText("INPUT GRABBED — ESC to release")
+        else:
+            self.release_grab()
+
+    def release_grab(self):
+        self.surface.grab_input = False
+        try:
+            self.surface.releaseMouse()
         except Exception:
             pass
+        self.surface.setCursor(Qt.ArrowCursor)
+        if self.grab_cb.isChecked():
+            self.grab_cb.blockSignals(True)
+            self.grab_cb.setChecked(False)
+            self.grab_cb.blockSignals(False)
+        if self.control_connected:
+            self.status_label.setText(
+                f"Live from {self.host_ip}:{self.video_port} · input released"
+            )
+
+    def _toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+            self.btn_fullscreen.setText("Fullscreen")
+        else:
+            self.showFullScreen()
+            self.btn_fullscreen.setText("Exit Fullscreen")
+
+    def closeEvent(self, event):
+        self.release_grab()
+        if self._reader:
+            self._reader.stop()
+        if self._thread:
+            self._thread.quit()
+            self._thread.wait(2000)
         try:
             self.control.close()
         except Exception:

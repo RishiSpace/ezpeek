@@ -38,7 +38,7 @@ class HostService:
         self,
         fps: int = 30,
         bitrate_kbps: int = 6000,
-        codec: str = "h264",
+        codec: str = "auto",
         port: int | None = None,
         enable_control: bool = True,
         use_nat: bool = False,

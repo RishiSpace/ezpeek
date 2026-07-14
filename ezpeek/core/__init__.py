@@ -1,7 +1,7 @@
 """Core ezpeek functionality."""
 from .capture import CaptureSpec, build_capture_input_args
 from .discovery import DiscoveryService
-from .encoder import EncodeSpec, build_video_encode_args, pick_hw_encoder
+from .encoder import EncodeSpec, build_video_encode_args, pick_hw_encoder, pick_encoder, describe_encode_choice
 from .host import HostService, HostState
 from .transport import TransportSpec, build_sender_cmd, build_receiver_cmd
 from .viewer import ViewerService, ViewerState
@@ -34,6 +34,8 @@ __all__ = [
     "EncodeSpec",
     "build_video_encode_args",
     "pick_hw_encoder",
+    "pick_encoder",
+    "describe_encode_choice",
     # Host
     "HostService",
     "HostState",

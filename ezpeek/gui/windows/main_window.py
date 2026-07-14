@@ -15,8 +15,8 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
 
 from ...core.discovery import DiscoveryService
+from ...core.encoder import describe_encode_choice, EncodeSpec
 from ...core.host import HostService
-from ...core.viewer import ViewerService
 from .viewer_window import ViewerWindow
 
 
@@ -27,8 +27,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("EzPeek")
         self.setMinimumSize(900, 600)
 
-        self.host = HostService(test_pattern=test_pattern)
-        self.viewer = ViewerService()
+        self.host = HostService(test_pattern=test_pattern, codec="auto")
         self._current_peer: dict = {}
         self.viewer_win: ViewerWindow | None = None
         self._test_pattern = test_pattern
@@ -60,8 +59,9 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 24px; color: white;")
 
         hint = QLabel(
-            "Phase 1 (LAN): Press H to host · Double-click a peer that shows video ports · "
-            "Enable Grab Input in the control window · Video opens in a separate ffplay window."
+            "Press H to host · Double-click a peer with video ports to view · "
+            "Video + mouse/keyboard share one window (Grab Input) · "
+            f"Encode preference: {describe_encode_choice(EncodeSpec(codec='auto'))}"
         )
         hint.setAlignment(Qt.AlignCenter)
         hint.setStyleSheet("color: #bbbbbb;")
@@ -167,11 +167,6 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Stop previous session
-        try:
-            self.viewer.stop()
-        except Exception:
-            pass
         if self.viewer_win:
             try:
                 self.viewer_win.close()
@@ -180,44 +175,35 @@ class MainWindow(QMainWindow):
             self.viewer_win = None
 
         self._current_peer = {"ip": ip, "port": port, "ctrl": ctrl}
-        print(f"[ezpeek] Connecting to {ip} video={port} ctrl={ctrl}")
+        print(f"[ezpeek] Connecting (integrated viewer) → {ip} video={port} ctrl={ctrl}")
 
-        # 1) Launch video first
-        try:
-            self.viewer.start(ip, int(port))
-        except Exception as e:
-            import traceback
-
-            traceback.print_exc()
-            self.status.setText(f"Status: Video failed: {e}")
-            QMessageBox.warning(
-                self,
-                "Video failed",
-                f"Could not start ffplay for {ip}:{port}\n\n{e}\n\n"
-                f"Check host is still hosting and firewall allows UDP {port}.",
-            )
-            return
-
-        # 2) Open control window (owns the control TCP connection)
         try:
             self.viewer_win = ViewerWindow(ip, int(port), int(ctrl) if ctrl else None)
             self.viewer_win.show()
             self.viewer_win.raise_()
             self.viewer_win.activateWindow()
         except Exception as e:
-            print(f"[ezpeek] ViewerWindow error: {e}")
+            import traceback
 
-        ctrl_ok = bool(self.viewer_win and self.viewer_win.control_connected)
+            traceback.print_exc()
+            self.status.setText(f"Status: Viewer failed: {e}")
+            QMessageBox.warning(
+                self,
+                "Viewer failed",
+                f"Could not open viewer for {ip}:{port}\n\n{e}\n\n"
+                f"Check host is still hosting and firewall allows UDP {port} / TCP control.",
+            )
+            return
+
+        ctrl_ok = bool(self.viewer_win.control_connected)
         if ctrl and ctrl_ok:
-            self.status.setText(f"Status: Viewing {ip}:{port} + control OK")
+            self.status.setText(f"Status: Viewing {ip}:{port} (integrated · control OK)")
         elif ctrl:
             self.status.setText(
-                f"Status: Viewing {ip}:{port} (video OK, control failed — check firewall TCP {ctrl})"
+                f"Status: Viewing {ip}:{port} (video starting; control failed — TCP {ctrl}?)"
             )
         else:
             self.status.setText(f"Status: Viewing {ip}:{port} (no control advertised)")
-
-        print("[ezpeek] Connect flow done. External ffplay should be visible.")
 
     def toggle_hosting(self) -> None:
         try:
@@ -233,15 +219,15 @@ class MainWindow(QMainWindow):
                 st = self.host.start()
                 ctrl = f"  ctrl:{st.control_port}" if st.control_port else "  (no control)"
                 mode = " [test pattern]" if self._test_pattern else ""
+                codec = describe_encode_choice(EncodeSpec(codec="auto"))
                 self.btn_host.setText("Stop Hosting (H)")
                 self.status.setText(
-                    f"Status: HOSTING{mode} — peers connect to {st.host_ip}:{st.port}{ctrl}"
+                    f"Status: HOSTING{mode} — {st.host_ip}:{st.port}{ctrl} · {codec}"
                 )
                 try:
                     self.discovery.force_broadcast()
                 except Exception:
                     pass
-                # Re-broadcast a few times so peers pick it up quickly
                 QTimer.singleShot(500, self._force_discovery)
                 QTimer.singleShot(1500, self._force_discovery)
         except Exception as e:
@@ -269,6 +255,10 @@ class MainWindow(QMainWindow):
                 self.host._stop_control()
             except Exception:
                 pass
+            try:
+                self.host._stop_screencast()
+            except Exception:
+                pass
             self.btn_host.setText("Start Hosting (H)")
             self.status.setText(
                 f"Status: Hosting stopped (sender died){': ' + err[:120] if err else ''}"
@@ -278,19 +268,9 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        # Detect viewer death
-        if self.viewer.state.proc is not None and self.viewer.state.proc.poll() is not None:
-            self.viewer.state.proc = None
-            if "Viewing" in (self.status.text() or ""):
-                self.status.setText("Status: Viewer process ended (ffplay closed)")
-
     def closeEvent(self, event):
         try:
             self.discovery.stop()
-        except Exception:
-            pass
-        try:
-            self.viewer.stop()
         except Exception:
             pass
         try:

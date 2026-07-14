@@ -48,14 +48,16 @@ ezpeek --test-pattern
    - TCP **2735** (control / input)
 4. Machine A: run `ezpeek` → press **H** (Linux Wayland: accept the screen-share portal). Status should show `HOSTING … ip:2734 ctrl:2735`.
 5. Machine B: wait until A appears with **video 2734** (not “not hosting”) → **double-click**.
-6. Video opens in an external **ffplay** window; the control window handles input — enable **Grab Input**.
+6. One **integrated viewer** opens: remote screen + mouse/keyboard. Enable **Grab Input** (ESC to release).
+
+**Codec:** auto-selects **hardware AV1** when encode actually works on the host GPU; otherwise **H.264** (HW if available, else libx264). Viewer decodes with ffmpeg (HW accel when available).
 
 Logs: `~/.cache/ezpeek/logs/` (Linux) or `%LOCALAPPDATA%\ezpeek\logs\` (Windows).
 
 In GUI:
 1. On machine A press **H** (or **Start Hosting**) to start **hosting**.
 2. On machine B the peer appears with video ports — double-click to view.
-3. In the control window enable **"Grab Input"** to forward mouse/keyboard.
+3. In the viewer enable **Grab Input** to control the remote from the same window.
 
 ## Configuration / Advanced
 HostService supports:

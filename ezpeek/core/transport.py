@@ -230,6 +230,12 @@ def build_sender_cmd(
         extra="snddropdelay=0",
     )
 
+    from .encoder import pick_encoder, mux_format_for_family
+
+    _enc_name, family = pick_encoder(encode.codec)
+    mux_fmt = mux_format_for_family(family)
+    print(f"[ezpeek] Stream mux format: {mux_fmt} (codec family={family}, encoder={_enc_name})")
+
     # Synthetic pattern for self-test / debugging without screen capture permissions.
     if test_pattern:
         fr = str(encode.fps)
@@ -239,10 +245,10 @@ def build_sender_cmd(
             "-loglevel", "warning",
             "-re",
             "-f", "lavfi",
-            "-i", f"testsrc=size=1280x720:rate={fr}",
+            "-i", f"testsrc=size=1280x720:rate={fr},format=yuv420p",
         ]
         cmd += build_video_encode_args(encode)
-        cmd += ["-f", "mpegts", out_url]
+        cmd += ["-f", mux_fmt, out_url]
         return cmd
 
     # Pure Wayland support when FFmpeg lacks native -f pipewire.
@@ -264,7 +270,7 @@ def build_sender_cmd(
                     pipeline = (
                         f"{wl_part} | {ffmpeg_exe} -hide_banner -loglevel warning "
                         f"-fflags nobuffer -flags low_delay -i - {encode_part} "
-                        f"-f mpegts '{out_url}'"
+                        f"-f {mux_fmt} '{out_url}'"
                     )
                     return ["sh", "-c", pipeline]
                 elif _has_gstreamer_pipewire() and pipewire_node_id is not None:
@@ -275,7 +281,6 @@ def build_sender_cmd(
                     #    held by HostService (do not request portal here and drop it).
                     log = gst_log_path or "/tmp/ezpeek_gst.log"
                     src = f"pipewiresrc path={int(pipewire_node_id)} do-timestamp=true"
-                    # Simpler caps: let videorate handle fps; avoid over-constraining.
                     gst = (
                         f"gst-launch-1.0 -q "
                         f"{src} ! "
@@ -284,13 +289,12 @@ def build_sender_cmd(
                         f"videorate ! video/x-raw,framerate={fr}/1 ! "
                         f"y4menc ! fdsink fd=1"
                     )
-                    # stderr from gst goes to log; stdout is pure Y4M for ffmpeg.
                     pipeline = (
                         f"{gst} 2>'{log}' | "
                         f"{ffmpeg_exe} -hide_banner -loglevel warning "
                         f"-fflags nobuffer -flags low_delay "
                         f"-f yuv4mpegpipe -i - "
-                        f"{encode_part} -f mpegts '{out_url}'"
+                        f"{encode_part} -f {mux_fmt} '{out_url}'"
                     )
                     print(f"[ezpeek] Wayland capture via GStreamer pipewire node={pipewire_node_id}")
                     print(f"[ezpeek] GStreamer log: {log}")
@@ -317,16 +321,16 @@ def build_sender_cmd(
     ]
     cmd += input_args
     cmd += build_video_encode_args(encode)
-    cmd += ["-f", "mpegts", out_url]
+    cmd += ["-f", mux_fmt, out_url]
     return cmd
 
 
 def _get_supported_hwaccels() -> str:
-    """Query ffplay for list of supported hardware accelerators."""
+    """Query ffmpeg for supported hardware accelerators (used for decode)."""
     try:
-        _, ffplay = _find_ffmpeg_executables()
+        ffmpeg, _ = _find_ffmpeg_executables()
         p = subprocess.run(
-            [ffplay, "-hide_banner", "-hwaccels"],
+            [ffmpeg, "-hide_banner", "-hwaccels"],
             capture_output=True,
             text=True,
             check=False,
@@ -337,9 +341,7 @@ def _get_supported_hwaccels() -> str:
 
 
 def _get_hwaccel_arg() -> list[str]:
-    """Return best-effort hwaccel flags for ffplay decode.
-    Falls back to software (no flag) if no supported HW accel is found.
-    """
+    """Best-effort hwaccel flags for decode (AV1/H.264). Empty = software."""
     txt = _get_supported_hwaccels().lower()
     sys_name = platform.system().lower()
 
@@ -348,15 +350,20 @@ def _get_hwaccel_arg() -> list[str]:
             return ["-hwaccel", "d3d11va"]
         if "cuda" in txt:
             return ["-hwaccel", "cuda"]
+        if "auto" in txt:
+            return ["-hwaccel", "auto"]
         return []
 
     if sys_name == "linux":
-        if "vaapi" in txt:
-            return ["-hwaccel", "vaapi"]
+        # Prefer CUDA/NVDEC when present (great for AV1), then VAAPI, then auto.
         if "cuda" in txt:
             return ["-hwaccel", "cuda"]
+        if "vaapi" in txt:
+            return ["-hwaccel", "vaapi"]
         if "vdpau" in txt:
             return ["-hwaccel", "vdpau"]
+        if "auto" in txt:
+            return ["-hwaccel", "auto"]
         return []
 
     if "auto" in txt:
@@ -371,10 +378,10 @@ def build_receiver_cmd(
     *,
     latency_ms: int = DEFAULT_SRT_LATENCY_MS,
 ) -> list[str]:
-    print(f"[ezpeek viewer] build_receiver_cmd called for {host}:{port}")
+    """Legacy external-ffplay command (debug only)."""
+    print(f"[ezpeek viewer] build_receiver_cmd (legacy ffplay) for {host}:{port}")
     ensure_ffmpeg_tools()
     _, ffplay_exe = _find_ffmpeg_executables()
-    print(f"[ezpeek viewer] Using ffplay executable: {ffplay_exe}")
     if transport != "srt":
         raise RuntimeError(f"Unsupported transport: {transport}")
     if not has_srt_support():
@@ -394,6 +401,4 @@ def build_receiver_cmd(
     cmd += hw
     srt = srt_url(host, port, mode="caller", latency_ms=latency_ms, extra="rcvlatency=0")
     cmd += [srt]
-    print(f"[ezpeek viewer] Full ffplay command: {cmd}")
-    print(f"[ezpeek viewer] SRT URL: {srt}")
     return cmd
