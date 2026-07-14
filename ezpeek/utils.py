@@ -81,15 +81,62 @@ def _iter_local_ipv4_candidates():
         pass
 
 
+def _is_virtualish_ip(ip: str) -> bool:
+    """Heuristic: docker / libvirt / common hypervisor host-only ranges."""
+    return ip.startswith(
+        (
+            "172.17.",
+            "172.18.",
+            "172.19.",
+            "172.20.",
+            "172.21.",
+            "172.22.",
+            "172.23.",
+            "172.24.",
+            "172.25.",
+            "172.26.",
+            "172.27.",
+            "172.28.",
+            "172.29.",
+            "172.30.",
+            "172.31.",
+            "192.168.122.",  # libvirt default
+            "192.168.56.",  # VirtualBox host-only common
+            "16.32.",  # VMware vmnet (seen on this machine)
+            "169.254.",
+        )
+    )
+
+
 def get_local_ip(prefer_private: bool = True) -> str:
     """
     Return the best local IPv4 for LAN discovery/hosting.
 
-    prefer_private:
-      - True: prefer RFC1918 private addresses (192.168/10/172.16-31)
-      - False: return first valid non-loopback address
+    Prefers the default-route interface (UDP connect trick) so we advertise an
+    address peers can actually route to, not a random virtual NIC.
     """
+    # 1) Default-route source address (most reliable for "how do I leave this host")
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("192.0.2.1", 9))  # TEST-NET-1; no packets need to arrive
+        route_ip = s.getsockname()[0]
+        s.close()
+        try:
+            addr = ipaddress.ip_address(route_ip)
+            if (
+                addr.version == 4
+                and not addr.is_loopback
+                and not addr.is_link_local
+                and not _is_virtualish_ip(route_ip)
+            ):
+                return route_ip
+        except ValueError:
+            pass
+    except OSError:
+        route_ip = None
+
     best_private = None
+    best_virtual = None
     best_non_loopback = None
 
     for ip in _iter_local_ipv4_candidates():
@@ -100,27 +147,31 @@ def get_local_ip(prefer_private: bool = True) -> str:
 
         if addr.version != 4:
             continue
-        if addr.is_loopback:
-            continue
-        if addr.is_link_local:  # 169.254.x.x
+        if addr.is_loopback or addr.is_link_local:
             continue
 
         if addr.is_private:
-            # Try to avoid common container/virtual networks unless that's all we have
-            # (heuristic only)
-            if ip.startswith(("172.17.", "172.18.", "172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
-                              "172.25.", "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.")) is False:
-                return ip
-            if best_private is None:
-                best_private = ip
+            if _is_virtualish_ip(ip):
+                if best_virtual is None:
+                    best_virtual = ip
+            else:
+                # Prefer 10.x / typical LAN over first-seen random private
+                if best_private is None or ip.startswith("10."):
+                    best_private = ip
+                    if ip.startswith("10."):
+                        return ip
         else:
             if best_non_loopback is None:
                 best_non_loopback = ip
 
     if prefer_private and best_private:
         return best_private
+    if route_ip and route_ip != "0.0.0.0":
+        return route_ip
     if best_non_loopback:
         return best_non_loopback
+    if best_virtual:
+        return best_virtual
     return "0.0.0.0"
 
 

@@ -428,8 +428,17 @@ class ViewerWindow(QMainWindow):
 
     @Slot(str)
     def _on_decode_fail(self, msg: str):
-        self.status_label.setText(f"Video error: {msg[:200]}")
-        print(f"[ezpeek viewer] decode failed: {msg}")
+        # Surface a short, actionable line in the UI
+        short = msg.replace("\n", " ").strip()
+        if "Connection to srt" in short or "Input/output error" in short:
+            tip = (
+                f"Cannot reach srt://{self.host_ip}:{self.video_port}. "
+                "Wrong IP, host not hosting, or firewall blocking UDP 2734."
+            )
+            self.status_label.setText(tip)
+        else:
+            self.status_label.setText(f"Video error: {short[:220]}")
+        print(f"[ezpeek viewer] decode failed for {self.host_ip}:{self.video_port}: {msg}")
 
     def _toggle_grab(self, state: int):
         on = bool(state)

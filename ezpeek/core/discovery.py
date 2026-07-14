@@ -173,9 +173,17 @@ class DiscoveryService:
 
                 parts = message.split("|")
                 name = parts[1] if len(parts) > 1 else "Unknown"
-                ip = parts[2] if len(parts) > 2 else addr[0]
-                if ip in ("0.0.0.0", "", None):
-                    ip = addr[0]
+                advertised_ip = parts[2] if len(parts) > 2 else addr[0]
+                if advertised_ip in ("0.0.0.0", "", None):
+                    advertised_ip = addr[0]
+
+                # CRITICAL: connect using the UDP *source* address, not the
+                # self-reported IP in the payload. Hosts often advertise a
+                # virtual/VPN NIC (e.g. 192.168.206.x) that peers cannot reach,
+                # while packets actually arrive from a reachable LAN IP.
+                src_ip = addr[0]
+                connect_ip = src_ip or advertised_ip
+
                 port_str = parts[3] if len(parts) > 3 else ""
                 port = int(port_str) if port_str.isdigit() else None
 
@@ -192,35 +200,45 @@ class DiscoveryService:
                         refresh_hz = None
 
                 # Skip self
-                if ip == self._my_ip or addr[0] == self._my_ip:
+                if connect_ip == self._my_ip or src_ip == self._my_ip:
+                    continue
+                if advertised_ip == self._my_ip and src_ip == self._my_ip:
                     continue
 
-                # Remember both advertised IP and packet source for unicast
                 with self._lock:
-                    self._known_peers.add(ip)
-                    if addr[0] and addr[0] != self._my_ip:
-                        self._known_peers.add(addr[0])
+                    self._known_peers.add(connect_ip)
+                    if advertised_ip and advertised_ip != self._my_ip:
+                        self._known_peers.add(advertised_ip)
 
-                # Unicast our hello back so the peer learns about us even if
-                # our broadcasts never reach them (or vice versa).
+                # Unicast our hello back (source first — known reachable path)
                 try:
                     reply = self._build_message()
-                    self.sock.sendto(reply.encode(), (addr[0], BROADCAST_PORT))
-                    if ip != addr[0]:
-                        self.sock.sendto(reply.encode(), (ip, BROADCAST_PORT))
+                    self.sock.sendto(reply.encode(), (src_ip, BROADCAST_PORT))
+                    if advertised_ip and advertised_ip != src_ip:
+                        try:
+                            self.sock.sendto(reply.encode(), (advertised_ip, BROADCAST_PORT))
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
-                key = (port, ctrl_port, refresh_hz)
-                prev = self._last.get(ip)
+                key = (port, ctrl_port, refresh_hz, advertised_ip)
+                prev = self._last.get(connect_ip)
                 if prev == key:
                     continue
-                self._last[ip] = key
+                self._last[connect_ip] = key
 
-                self._emit_peer(name, ip, port, ctrl_port, refresh_hz)
+                if advertised_ip and advertised_ip != connect_ip:
+                    print(
+                        f"[ezpeek] Peer {name} advertised {advertised_ip} but "
+                        f"packets come from {connect_ip} — using {connect_ip} for connections"
+                    )
+
+                self._emit_peer(name, connect_ip, port, ctrl_port, refresh_hz)
                 print(
-                    f"[ezpeek] Discovered peer: {name} @ {ip} "
-                    f"video={port} ctrl={ctrl_port} hz={refresh_hz} (src={addr[0]})"
+                    f"[ezpeek] Discovered peer: {name} @ {connect_ip} "
+                    f"video={port} ctrl={ctrl_port} hz={refresh_hz} "
+                    f"(advertised={advertised_ip}, src={src_ip})"
                 )
 
             except socket.timeout:
