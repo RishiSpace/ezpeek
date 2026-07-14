@@ -34,6 +34,7 @@ from PySide6.QtGui import (
 
 from ...core.control import ControlClient
 from ...core.viewer import build_integrated_decode_cmd
+from ...utils import get_display_refresh_hz
 
 
 class _MjpegReader(QObject):
@@ -315,6 +316,9 @@ class ViewerWindow(QMainWindow):
         self._thread: Optional[QThread] = None
         self._reader: Optional[_MjpegReader] = None
 
+        self.local_hz = get_display_refresh_hz()
+        print(f"[ezpeek viewer] Local display refresh ≈ {self.local_hz:.2f} Hz")
+
         self._build_ui()
         self._connect_control()
         self._start_video()
@@ -360,7 +364,11 @@ class ViewerWindow(QMainWindow):
             self.host_ip, int(self.ctrl_port), timeout=4.0, retries=4
         )
         if self.control_connected:
-            self.status_label.setText(f"Control OK → {self.host_ip}:{self.ctrl_port}")
+            # Negotiate stream FPS: host will use min(host_hz, our_hz)
+            self.control.send_client_caps(self.local_hz)
+            self.status_label.setText(
+                f"Control OK → {self.host_ip}:{self.ctrl_port} · our panel {self.local_hz:.0f} Hz"
+            )
         else:
             self.status_label.setText(
                 f"Control failed ({self.host_ip}:{self.ctrl_port}) — video may still work"

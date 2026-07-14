@@ -17,6 +17,12 @@ from PySide6.QtGui import QKeySequence, QShortcut
 from ...core.discovery import DiscoveryService
 from ...core.encoder import describe_encode_choice, EncodeSpec
 from ...core.host import HostService
+from ...utils import (
+    BITRATE_MAX_KBPS,
+    BITRATE_MIN_KBPS,
+    BITRATE_TARGET_KBPS,
+    get_display_refresh_hz,
+)
 from .viewer_window import ViewerWindow
 
 
@@ -27,11 +33,22 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("EzPeek")
         self.setMinimumSize(900, 600)
 
-        self.host = HostService(test_pattern=test_pattern, codec="auto")
+        self.local_hz = get_display_refresh_hz()
+        self.host = HostService(
+            test_pattern=test_pattern,
+            codec="auto",
+            host_hz=self.local_hz,
+            bitrate_kbps=BITRATE_TARGET_KBPS,
+            bitrate_min_kbps=BITRATE_MIN_KBPS,
+            bitrate_max_kbps=BITRATE_MAX_KBPS,
+        )
         self._current_peer: dict = {}
         self.viewer_win: ViewerWindow | None = None
         self._test_pattern = test_pattern
+        # ip -> last known peer refresh Hz from discovery
+        self._peer_hz: dict[str, float] = {}
 
+        print(f"[ezpeek] Local display refresh ≈ {self.local_hz:.2f} Hz")
         self.setup_ui()
 
         self._host_shortcut = QShortcut(QKeySequence("H"), self)
@@ -61,7 +78,10 @@ class MainWindow(QMainWindow):
         hint = QLabel(
             "Press H to host · Double-click a peer with video ports to view · "
             "Video + mouse/keyboard share one window (Grab Input) · "
-            f"Encode preference: {describe_encode_choice(EncodeSpec(codec='auto'))}"
+            f"This display ≈ {self.local_hz:.0f} Hz · "
+            f"stream FPS = min(host, viewer) · "
+            f"VBR {BITRATE_MIN_KBPS//1000}-{BITRATE_MAX_KBPS//1000} Mbps · "
+            f"{describe_encode_choice(EncodeSpec(codec='auto', fps=int(self.local_hz), bitrate_kbps=BITRATE_TARGET_KBPS, bitrate_min_kbps=BITRATE_MIN_KBPS, bitrate_max_kbps=BITRATE_MAX_KBPS))}"
         )
         hint.setAlignment(Qt.AlignCenter)
         hint.setStyleSheet("color: #bbbbbb;")
@@ -120,23 +140,36 @@ class MainWindow(QMainWindow):
             self.status.setText(f"Status: Discovery ping failed: {e}")
 
     def _my_advertisement(self):
+        # Always advertise our display Hz so peers can show/log it.
+        adv: dict = {"hz": f"{self.local_hz:.2f}"}
         if self.host.state.proc and self.host.state.proc.poll() is None:
-            adv = {"port": self.host.state.port}
+            adv["port"] = self.host.state.port
             if self.host.state.control_port:
                 adv["ctrl"] = self.host.state.control_port
-            return adv
-        return {}
+        return adv
 
-    def add_peer(self, name, ip, port, ctrl_port=None):
+    def add_peer(self, name, ip, port, ctrl_port=None, refresh_hz=None):
+        if refresh_hz:
+            try:
+                self._peer_hz[ip] = float(refresh_hz)
+            except (TypeError, ValueError):
+                pass
+        hz = self._peer_hz.get(ip)
+
         label = f"{name}  —  {ip}"
+        if hz:
+            label += f"  [{hz:.0f} Hz]"
         if port:
-            label += f"  (video {port})"
+            label += f"  (video {port}"
+            if self.host.state.stream_fps and port:
+                pass
+            label += ")"
         else:
             label += "  (not hosting)"
         if ctrl_port:
             label += f" +ctrl {ctrl_port}"
 
-        data = {"name": name, "ip": ip, "port": port, "ctrl": ctrl_port}
+        data = {"name": name, "ip": ip, "port": port, "ctrl": ctrl_port, "hz": hz}
 
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
@@ -219,10 +252,19 @@ class MainWindow(QMainWindow):
                 st = self.host.start()
                 ctrl = f"  ctrl:{st.control_port}" if st.control_port else "  (no control)"
                 mode = " [test pattern]" if self._test_pattern else ""
-                codec = describe_encode_choice(EncodeSpec(codec="auto"))
+                codec = describe_encode_choice(
+                    EncodeSpec(
+                        codec="auto",
+                        fps=st.stream_fps,
+                        bitrate_kbps=st.bitrate_target_kbps,
+                        bitrate_min_kbps=st.bitrate_min_kbps,
+                        bitrate_max_kbps=st.bitrate_max_kbps,
+                    )
+                )
                 self.btn_host.setText("Stop Hosting (H)")
                 self.status.setText(
-                    f"Status: HOSTING{mode} — {st.host_ip}:{st.port}{ctrl} · {codec}"
+                    f"Status: HOSTING{mode} — {st.host_ip}:{st.port}{ctrl} · "
+                    f"panel {st.host_hz:.0f} Hz → {st.stream_fps} fps · {codec}"
                 )
                 try:
                     self.discovery.force_broadcast()

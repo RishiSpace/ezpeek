@@ -14,9 +14,12 @@ VideoCodec = Literal["auto", "av1", "h264", "hevc"]
 class EncodeSpec:
     # "auto" = prefer working HW AV1, else working HW/soft H.264
     codec: VideoCodec = "auto"
-    bitrate_kbps: int = 6000
-    fps: int = 30
-    gop: int = 30
+    # VBR target / range (kbps). Encoders clamp inside [bitrate_min, bitrate_max].
+    bitrate_kbps: int = 12000
+    bitrate_min_kbps: int = 3000
+    bitrate_max_kbps: int = 30000
+    fps: int = 60
+    gop: int = 60
     width: Optional[int] = None
     height: Optional[int] = None
 
@@ -196,8 +199,15 @@ def mux_format_for_family(family: str) -> str:
 
 
 def build_video_encode_args(spec: EncodeSpec) -> list[str]:
-    """Build ffmpeg output-side encode args for low-latency streaming."""
-    bitrate = f"{spec.bitrate_kbps}k"
+    """Build ffmpeg output-side encode args for low-latency streaming (VBR where possible)."""
+    target = max(spec.bitrate_min_kbps, min(spec.bitrate_max_kbps, spec.bitrate_kbps))
+    bmin = max(500, min(spec.bitrate_min_kbps, target))
+    bmax = max(target, spec.bitrate_max_kbps)
+    bitrate = f"{target}k"
+    maxrate = f"{bmax}k"
+    minrate = f"{bmin}k"
+    # bufsize ~ 1s at max for smoother VBR
+    bufsize = f"{max(bmax, target)}k"
     gop = str(max(spec.gop, 1))
 
     args: list[str] = []
@@ -214,8 +224,9 @@ def build_video_encode_args(spec: EncodeSpec) -> list[str]:
             "-g", gop,
             "-keyint_min", gop,
             "-b:v", bitrate,
-            "-maxrate", bitrate,
-            "-bufsize", "2M",
+            "-minrate", minrate,
+            "-maxrate", maxrate,
+            "-bufsize", bufsize,
             "-pix_fmt", "yuv420p",
         ]
         return args
@@ -227,27 +238,38 @@ def build_video_encode_args(spec: EncodeSpec) -> list[str]:
             "-tune", "zerolatency",
             "-g", gop,
             "-b:v", bitrate,
+            "-maxrate", maxrate,
+            "-bufsize", bufsize,
             "-pix_fmt", "yuv420p",
         ]
         return args
 
     if enc in ("libsvtav1", "libaom-av1", "librav1e"):
-        args += ["-c:v", enc, "-g", gop, "-b:v", bitrate, "-pix_fmt", "yuv420p"]
+        args += [
+            "-c:v", enc,
+            "-g", gop,
+            "-b:v", bitrate,
+            "-maxrate", maxrate,
+            "-pix_fmt", "yuv420p",
+        ]
         if enc == "libsvtav1":
             args += ["-preset", "10", "-svtav1-params", "lp=1:fast-decode=1"]
         return args
 
-    args += ["-c:v", enc, "-g", gop, "-b:v", bitrate, "-pix_fmt", "yuv420p"]
+    # Hardware encoders — prefer VBR with max cap in the 3–30 Mbps band
+    args += ["-c:v", enc, "-g", gop, "-b:v", bitrate, "-maxrate", maxrate, "-pix_fmt", "yuv420p"]
 
     if enc.endswith("_nvenc"):
+        # vbr + low latency; maxrate caps peaks
         if family == "av1":
-            args += ["-preset", "p1", "-tune", "ull", "-rc", "cbr"]
+            args += ["-preset", "p1", "-tune", "ull", "-rc", "vbr"]
         else:
-            args += ["-preset", "p1", "-tune", "ll", "-rc", "cbr"]
+            args += ["-preset", "p1", "-tune", "ll", "-rc", "vbr"]
+        args += ["-bufsize", bufsize]
     elif enc.endswith("_qsv"):
         args += ["-preset", "veryfast", "-look_ahead", "0"]
     elif enc.endswith("_amf"):
-        args += ["-usage", "lowlatency", "-rc", "cbr"]
+        args += ["-usage", "lowlatency", "-rc", "vbr_latency"]
     elif enc.endswith("_mf"):
         pass
 
@@ -257,4 +279,8 @@ def build_video_encode_args(spec: EncodeSpec) -> list[str]:
 def describe_encode_choice(spec: EncodeSpec | None = None) -> str:
     spec = spec or EncodeSpec()
     enc, family = pick_encoder(spec.codec)
-    return f"{family.upper()} via {enc}"
+    return (
+        f"{family.upper()} via {enc} · "
+        f"VBR {spec.bitrate_min_kbps}-{spec.bitrate_max_kbps} kbps "
+        f"(target {spec.bitrate_kbps}) · {spec.fps} fps"
+    )

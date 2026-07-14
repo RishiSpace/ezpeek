@@ -30,9 +30,10 @@ class DiscoveryService:
     LAN peer discovery via UDP broadcast.
 
     Packet format:
-      EZPEEK_HELLO|<hostname>|<ip>|<video_port>|<ctrl_port>
+      EZPEEK_HELLO|<hostname>|<ip>|<video_port>|<ctrl_port>|<refresh_hz>
 
     Empty video/ctrl fields mean the peer is online but not hosting.
+    refresh_hz is the peer's primary display refresh rate (for FPS negotiation).
     """
 
     def __init__(
@@ -41,14 +42,14 @@ class DiscoveryService:
         get_advertisement: Optional[Callable] = None,
     ):
         """
-        on_peer_found: callback(name, ip, port|None, ctrl_port=None)
-        get_advertisement: callable returning dict e.g. {"port": 2734, "ctrl": 2735}
+        on_peer_found: callback(name, ip, port|None, ctrl_port=None, refresh_hz=None)
+        get_advertisement: callable returning dict e.g. {"port": 2734, "ctrl": 2735, "hz": 144}
         """
         self.on_peer_found = on_peer_found
         self.get_advertisement = get_advertisement
         self.running = False
-        # ip -> last advertised (port, ctrl) so we re-notify on change
-        self._last: dict[str, tuple[Optional[int], Optional[int]]] = {}
+        # ip -> last advertised (port, ctrl, hz)
+        self._last: dict[str, tuple[Optional[int], Optional[int], Optional[float]]] = {}
         self._my_ip = get_local_ip()
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -88,7 +89,8 @@ class DiscoveryService:
             adv = {}
         video_port = adv.get("port") or adv.get("video_port") or ""
         ctrl = adv.get("ctrl") or adv.get("control_port") or ""
-        return f"{MAGIC}|{socket.gethostname()}|{self._my_ip}|{video_port}|{ctrl}"
+        hz = adv.get("hz") or adv.get("refresh") or ""
+        return f"{MAGIC}|{socket.gethostname()}|{self._my_ip}|{video_port}|{ctrl}|{hz}"
 
     def _send_message(self, message: str) -> None:
         msg = message.encode()
@@ -124,13 +126,23 @@ class DiscoveryService:
             # Faster when hosting so peers pick up ports quickly
             time.sleep(1.5)
 
-    def _emit_peer(self, name: str, ip: str, port: Optional[int], ctrl_port: Optional[int]):
+    def _emit_peer(
+        self,
+        name: str,
+        ip: str,
+        port: Optional[int],
+        ctrl_port: Optional[int],
+        refresh_hz: Optional[float] = None,
+    ):
         if not self.on_peer_found:
             return
         try:
-            self.on_peer_found(name, ip, port, ctrl_port=ctrl_port)
+            self.on_peer_found(name, ip, port, ctrl_port=ctrl_port, refresh_hz=refresh_hz)
         except TypeError:
-            self.on_peer_found(name, ip, port)
+            try:
+                self.on_peer_found(name, ip, port, ctrl_port=ctrl_port)
+            except TypeError:
+                self.on_peer_found(name, ip, port)
 
     def _listener(self):
         while self.running:
@@ -156,20 +168,27 @@ class DiscoveryService:
                     cstr = parts[4]
                     ctrl_port = int(cstr) if cstr.isdigit() else None
 
+                refresh_hz = None
+                if len(parts) > 5 and parts[5]:
+                    try:
+                        refresh_hz = float(parts[5])
+                    except ValueError:
+                        refresh_hz = None
+
                 # Skip self (compare both advertised IP and packet source)
                 if ip == self._my_ip or addr[0] == self._my_ip:
                     continue
 
-                key = (port, ctrl_port)
+                key = (port, ctrl_port, refresh_hz)
                 prev = self._last.get(ip)
                 if prev == key:
                     continue
                 self._last[ip] = key
 
-                self._emit_peer(name, ip, port, ctrl_port)
+                self._emit_peer(name, ip, port, ctrl_port, refresh_hz)
                 print(
                     f"[ezpeek] Discovered peer: {name} @ {ip} "
-                    f"video={port} ctrl={ctrl_port}"
+                    f"video={port} ctrl={ctrl_port} hz={refresh_hz}"
                 )
 
             except socket.timeout:

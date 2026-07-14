@@ -6,6 +6,7 @@ Protocol (simple, human readable, newline delimited):
   MOUSE_CLICK <button> [down|up]
   MOUSE_WHEEL <delta>
   KEY <key> [down|up]
+  CLIENT_CAPS refresh=<hz>   (viewer → host: display refresh for FPS negotiation)
   PING
   QUIT
 
@@ -152,12 +153,11 @@ class ControlServer:
                 key = parts[1]
                 down = parts[2].lower() != "up" if len(parts) > 2 else True
                 self.input.send_key(key, down=down)
+            elif cmd == "CLIENT_CAPS":
+                # Handled via on_event on HostService (refresh negotiation).
+                print(f"[ezpeek-control] {msg}")
             elif cmd == "PING":
-                try:
-                    client_reply = None  # fire-and-forget for Phase 1
-                    _ = client_reply
-                except Exception:
-                    pass
+                pass
             elif cmd == "QUIT":
                 pass
         except Exception as e:
@@ -237,6 +237,10 @@ class ControlClient:
     def key(self, key: str, down: bool = True) -> bool:
         state = "down" if down else "up"
         return self.send(f"KEY {key} {state}")
+
+    def send_client_caps(self, refresh_hz: float) -> bool:
+        """Tell the host our display refresh rate so it can pick min(host, client) FPS."""
+        return self.send(f"CLIENT_CAPS refresh={float(refresh_hz):.2f}")
 
     def close(self):
         if self._sock:

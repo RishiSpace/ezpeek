@@ -1,8 +1,22 @@
 import ipaddress
 import os
+import platform
+import re
 import socket
+import subprocess
 import tempfile
 from pathlib import Path
+from typing import Optional
+
+
+# Stream quality bounds (kbps). Encoders use VBR/CBR-with-cap inside this range.
+BITRATE_MIN_KBPS = 3000
+BITRATE_MAX_KBPS = 30000
+BITRATE_TARGET_KBPS = 12000  # preferred average when VBR is available
+
+# Practical stream FPS clamps (some panels report odd floats)
+FPS_MIN = 24
+FPS_MAX = 240
 
 
 def get_log_dir() -> Path:
@@ -108,3 +122,163 @@ def get_local_ip(prefer_private: bool = True) -> str:
     if best_non_loopback:
         return best_non_loopback
     return "0.0.0.0"
+
+
+def get_display_refresh_hz() -> float:
+    """
+    Best-effort primary display refresh rate (Hz).
+
+    Order: Qt (if a QGuiApplication exists) → platform APIs → 60 Hz default.
+    """
+    hz = _refresh_hz_qt()
+    if hz:
+        return _clamp_hz(hz)
+
+    sys_name = platform.system().lower()
+    if sys_name == "windows":
+        hz = _refresh_hz_windows()
+    elif sys_name == "linux":
+        hz = _refresh_hz_linux()
+    else:
+        hz = None
+
+    return _clamp_hz(hz or 60.0)
+
+
+def _clamp_hz(hz: float) -> float:
+    try:
+        v = float(hz)
+    except (TypeError, ValueError):
+        return 60.0
+    if v < 20 or v > 500:
+        return 60.0
+    return v
+
+
+def _refresh_hz_qt() -> Optional[float]:
+    try:
+        from PySide6.QtGui import QGuiApplication
+
+        app = QGuiApplication.instance()
+        if app is None:
+            return None
+        screen = app.primaryScreen()
+        if screen is None:
+            return None
+        rate = float(screen.refreshRate())
+        return rate if rate >= 20 else None
+    except Exception:
+        return None
+
+
+def _refresh_hz_windows() -> Optional[float]:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class DEVMODE(ctypes.Structure):
+            _fields_ = [
+                ("dmDeviceName", wintypes.WCHAR * 32),
+                ("dmSpecVersion", wintypes.WORD),
+                ("dmDriverVersion", wintypes.WORD),
+                ("dmSize", wintypes.WORD),
+                ("dmDriverExtra", wintypes.WORD),
+                ("dmFields", wintypes.DWORD),
+                ("dmPositionX", ctypes.c_long),
+                ("dmPositionY", ctypes.c_long),
+                ("dmDisplayOrientation", wintypes.DWORD),
+                ("dmDisplayFixedOutput", wintypes.DWORD),
+                ("dmColor", wintypes.SHORT),
+                ("dmDuplex", wintypes.SHORT),
+                ("dmYResolution", wintypes.SHORT),
+                ("dmTTOption", wintypes.SHORT),
+                ("dmCollate", wintypes.SHORT),
+                ("dmFormName", wintypes.WCHAR * 32),
+                ("dmLogPixels", wintypes.WORD),
+                ("dmBitsPerPel", wintypes.DWORD),
+                ("dmPelsWidth", wintypes.DWORD),
+                ("dmPelsHeight", wintypes.DWORD),
+                ("dmDisplayFlags", wintypes.DWORD),
+                ("dmDisplayFrequency", wintypes.DWORD),
+                ("dmICMMethod", wintypes.DWORD),
+                ("dmICMIntent", wintypes.DWORD),
+                ("dmMediaType", wintypes.DWORD),
+                ("dmDitherType", wintypes.DWORD),
+                ("dmReserved1", wintypes.DWORD),
+                ("dmReserved2", wintypes.DWORD),
+                ("dmPanningWidth", wintypes.DWORD),
+                ("dmPanningHeight", wintypes.DWORD),
+            ]
+
+        dm = DEVMODE()
+        dm.dmSize = ctypes.sizeof(DEVMODE)
+        # ENUM_CURRENT_SETTINGS = -1
+        if ctypes.windll.user32.EnumDisplaySettingsW(None, -1, ctypes.byref(dm)):
+            freq = int(dm.dmDisplayFrequency)
+            if freq > 1:
+                return float(freq)
+    except Exception:
+        pass
+    return None
+
+
+def _refresh_hz_linux() -> Optional[float]:
+    # xrandr (X11 / XWayland)
+    try:
+        p = subprocess.run(
+            ["xrandr"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+        txt = p.stdout or ""
+        # lines like: "   2560x1600    165.00*+  60.00"
+        best = None
+        for line in txt.splitlines():
+            if "*" in line:
+                nums = re.findall(r"(\d+\.?\d*)\*", line)
+                if nums:
+                    best = float(nums[0])
+                    break
+                nums = re.findall(r"(\d+\.?\d*)", line)
+                # pick number nearest a '*' marker
+                m = re.search(r"(\d+\.?\d*)\s*\*", line)
+                if m:
+                    best = float(m.group(1))
+                    break
+        if best:
+            return best
+    except Exception:
+        pass
+
+    # wlr-randr (some wlroots compositors)
+    try:
+        p = subprocess.run(
+            ["wlr-randr"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+        for line in (p.stdout or "").splitlines():
+            if "current" in line.lower() and "Hz" in line:
+                m = re.search(r"(\d+\.?\d*)\s*Hz", line)
+                if m:
+                    return float(m.group(1))
+    except Exception:
+        pass
+
+    return None
+
+
+def effective_stream_fps(host_hz: float, peer_hz: Optional[float] = None) -> int:
+    """
+    Stream FPS = floor(min(host, peer)) clamped to [FPS_MIN, FPS_MAX].
+    If peer unknown, use host rate alone.
+    """
+    rates = [float(host_hz)]
+    if peer_hz is not None and peer_hz > 0:
+        rates.append(float(peer_hz))
+    fps = int(min(rates))
+    return max(FPS_MIN, min(FPS_MAX, fps))
