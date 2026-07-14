@@ -36,9 +36,14 @@ def build_integrated_decode_cmd(
     latency_ms: int = DEFAULT_SRT_LATENCY_MS,
     max_width: int = 1920,
     use_hwaccel: bool = False,
+    transport: str = "srt",
 ) -> list[str]:
     """
-    Decode SRT stream to an MJPEG pipe for the integrated Qt viewer.
+    Decode stream to an MJPEG pipe for the integrated Qt viewer.
+
+    transport:
+      - "srt"  — LAN SRT caller (default)
+      - "tcp"  — MPEG-TS/Matroska over TCP (cloud reverse-proxy local endpoint)
 
     Default is *software* decode (libdav1d / native). HW accel is optional because
     d3d11va/cuda often hang or fail on mixed AV1/H.264 LAN streams and leave the
@@ -46,10 +51,14 @@ def build_integrated_decode_cmd(
     """
     ensure_ffmpeg_tools()
     ffmpeg_exe, _ = _find_ffmpeg_executables()
-    if not has_srt_support():
-        raise RuntimeError("FFmpeg has no SRT support")
 
-    srt = srt_url(host, port, mode="caller", latency_ms=latency_ms, extra="rcvlatency=0")
+    if transport == "tcp":
+        # Local tunnel endpoint from RelayViewerTunnel (or direct TCP).
+        in_url = f"tcp://{host}:{port}"
+    else:
+        if not has_srt_support():
+            raise RuntimeError("FFmpeg has no SRT support")
+        in_url = srt_url(host, port, mode="caller", latency_ms=latency_ms, extra="rcvlatency=0")
 
     cmd = [
         ffmpeg_exe,
@@ -59,19 +68,19 @@ def build_integrated_decode_cmd(
         "-flags", "low_delay",
         "-probesize", "1000000",
         "-analyzeduration", "1000000",
-        "-rw_timeout", "5000000",  # 5s I/O timeout (microseconds) where supported
+        "-rw_timeout", "15000000",  # 15s — cloud relay pair can take a moment
     ]
     if use_hwaccel:
         cmd += _get_hwaccel_arg()
     cmd += [
-        "-i", srt,
+        "-i", in_url,
         "-vf", f"scale='min({max_width},iw)':-2",
         "-an",
         "-f", "mjpeg",
         "-q:v", "5",
         "pipe:1",
     ]
-    print(f"[ezpeek viewer] integrated decode cmd (hw={use_hwaccel}): {cmd}")
+    print(f"[ezpeek viewer] integrated decode cmd (hw={use_hwaccel} tx={transport}): {cmd}")
     return cmd
 
 

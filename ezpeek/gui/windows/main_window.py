@@ -21,11 +21,11 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
 
 from ...cloud import CloudClient, CloudError, clear_session
-from ...cloud.client import RelayHostAgent
-from ...cloud.config import relay_endpoint_from_server_url
+from ...cloud.client import RelayHostAgent, RelayViewerTunnel
 from ...core.discovery import DiscoveryService
 from ...core.encoder import describe_encode_choice, EncodeSpec
 from ...core.host import HostService
+from ...core.transport import DEFAULT_CLOUD_TCP_PORT
 from ...utils import (
     BITRATE_MAX_KBPS,
     BITRATE_MIN_KBPS,
@@ -34,6 +34,43 @@ from ...utils import (
     get_local_ip,
 )
 from .viewer_window import ViewerWindow
+
+# Viewer-side local ports for cloud reverse-proxy (outbound-only WAN).
+_VIEW_CTRL_LOCAL = 12735
+_VIEW_VIDEO_LOCAL = 12734
+
+
+def _is_private_ip(ip: str) -> bool:
+    return (
+        ip.startswith("10.")
+        or ip.startswith("192.168.")
+        or ip.startswith("172.16.")
+        or ip.startswith("172.17.")
+        or ip.startswith("172.18.")
+        or ip.startswith("172.19.")
+        or ip.startswith("172.2")
+        or ip.startswith("172.30.")
+        or ip.startswith("172.31.")
+    )
+
+
+def _pick_lan_peer(my_ip: str, peer_ips: list) -> Optional[str]:
+    """Return a peer LAN IP only if it looks reachable on our private network."""
+    if not my_ip or not _is_private_ip(my_ip):
+        return None
+    for ip in peer_ips:
+        if not ip or not _is_private_ip(ip):
+            continue
+        # Same /16 for 10.x / 192.168.x or same 10.x.y for coarse match
+        if my_ip.startswith("192.168.") and ip.startswith("192.168."):
+            if my_ip.rsplit(".", 1)[0] == ip.rsplit(".", 1)[0] or my_ip.split(".")[:2] == ip.split(".")[:2]:
+                return ip
+        if my_ip.startswith("10.") and ip.startswith("10."):
+            if my_ip.split(".")[:2] == ip.split(".")[:2]:
+                return ip
+        if my_ip[:7] == ip[:7] and my_ip.startswith("172."):
+            return ip
+    return None
 
 
 class MainWindow(QMainWindow):
@@ -46,6 +83,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1000, 640)
 
         self.local_hz = get_display_refresh_hz()
+        # Cloud login → dual-publish SRT (LAN) + localhost TCP (relay / no home ports).
         self.host = HostService(
             test_pattern=test_pattern,
             codec="auto",
@@ -53,15 +91,18 @@ class MainWindow(QMainWindow):
             bitrate_kbps=BITRATE_TARGET_KBPS,
             bitrate_min_kbps=BITRATE_MIN_KBPS,
             bitrate_max_kbps=BITRATE_MAX_KBPS,
+            cloud_tcp_publish=bool(cloud and cloud.token),
         )
         self._current_peer: dict = {}
         self.viewer_win: ViewerWindow | None = None
         self._test_pattern = test_pattern
         self._peer_hz: dict[str, float] = {}
-        self._relay_agent: Optional[RelayHostAgent] = None
+        self._relay_agents: list[RelayHostAgent] = []
+        self._ice: dict = {}
 
         print(f"[ezpeek] Local display refresh ≈ {self.local_hz:.2f} Hz user={uname}")
         self.setup_ui()
+        self._load_ice()
 
         self._host_shortcut = QShortcut(QKeySequence("H"), self)
         self._host_shortcut.activated.connect(self.toggle_hosting)
@@ -100,8 +141,9 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 22px; color: white;")
 
         hint = QLabel(
-            "LAN devices (left) · Friends via greenbird (right) · "
-            "H = host · Double-click LAN peer or use Connect on a hosting friend · "
+            "LAN devices (left) · Friends via cloud (right) · "
+            "H = host · Double-click LAN peer or Connect a hosting friend · "
+            "Cloud path: no inbound ports on your machine (TCP reverse-proxy + STUN/TURN on server) · "
             f"CBR {BITRATE_TARGET_KBPS // 1000} Mbps · panel ≈ {self.local_hz:.0f} Hz"
         )
         hint.setAlignment(Qt.AlignCenter)
@@ -137,7 +179,7 @@ class MainWindow(QMainWindow):
         # Friends
         fr_box = QWidget()
         fr_l = QVBoxLayout(fr_box)
-        fr_l.addWidget(QLabel("Friends (greenbird)"))
+        fr_l.addWidget(QLabel("Friends (cloud)"))
         self.friends_list = QListWidget()
         fr_l.addWidget(self.friends_list)
         fr_btns = QHBoxLayout()
@@ -192,6 +234,21 @@ class MainWindow(QMainWindow):
         )
 
     # ----- presence / friends -----
+    def _load_ice(self):
+        if not self.cloud or not self.cloud.token:
+            return
+        try:
+            self._ice = self.cloud.ice()
+            stun = self._ice.get("stun") or []
+            turn = self._ice.get("turn") or []
+            print(
+                f"[ezpeek] ICE: stun={len(stun)} turn={len(turn)} "
+                f"relay={self._ice.get('relay')} stun_running={self._ice.get('stun_running')}"
+            )
+        except CloudError as e:
+            print(f"[ezpeek] ICE fetch failed: {e}")
+            self._ice = {}
+
     def _lan_ips(self) -> list[str]:
         ips = []
         try:
@@ -213,7 +270,7 @@ class MainWindow(QMainWindow):
                 lan_ips=self._lan_ips(),
                 video_port=self.host.state.port if hosting else None,
                 ctrl_port=self.host.state.control_port if hosting else None,
-                relay_ready=bool(self._relay_agent),
+                relay_ready=bool(self._relay_agents),
             )
         except CloudError as e:
             print(f"[ezpeek] presence push failed: {e}")
@@ -300,7 +357,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Prefer LAN IP that looks like our network
+        # Prefer LAN only when we share a private subnet (else cloud TCP relay).
         my_ip = get_local_ip()
         ips = info.get("lan_ips") or []
         if isinstance(ips, str):
@@ -308,37 +365,36 @@ class MainWindow(QMainWindow):
                 ips = json.loads(ips)
             except Exception:
                 ips = []
-        target_ip = None
-        for ip in ips:
-            if my_ip.startswith("10.") and ip.startswith("10."):
-                target_ip = ip
-                break
-        if not target_ip and ips:
-            target_ip = ips[0]
+        target_ip = _pick_lan_peer(my_ip, ips)
 
         port = info.get("video_port") or 2734
         ctrl = info.get("ctrl_port") or 2735
 
         if target_ip:
+            # Same/private network: direct SRT (fast path)
             self.status.setText(f"Status: Connecting to @{username} via LAN {target_ip}…")
             self._open_viewer(target_ip, int(port), int(ctrl) if ctrl else None)
             return
 
-        # Relay path for control (video still needs LAN/SRT for now)
-        QMessageBox.information(
-            self,
-            "Remote connect",
-            f"@{username} has no reachable LAN IP from here.\n"
-            "Control can use greenbird reverse-proxy; for full video, use the same LAN "
-            "or ensure the host publishes a reachable IP.\n\n"
-            "Opening control tunnel + attempting LAN video ports if any…",
-        )
-        # Still try relay host from API
-        relay = info.get("relay") or {}
-        # Video without LAN is limited; show message
-        self.status.setText(
-            f"Status: @{username} remote — no LAN IP; use same network for video for now."
-        )
+        # Cloud reverse-proxy: both sides dial out — no inbound ports on either PC.
+        if not info.get("relay_ready") and not info.get("hosting"):
+            QMessageBox.information(
+                self, "Connect", f"@{username} is not hosting / relay-ready yet."
+            )
+            return
+        if not info.get("relay_ready"):
+            # Host may still be starting agents — try anyway if hosting
+            print(f"[ezpeek] @{username} hosting but relay_ready=false; attempting relay…")
+
+        self.status.setText(f"Status: Connecting to @{username} via cloud TCP relay…")
+        try:
+            self._open_viewer_via_cloud(username, info)
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            QMessageBox.warning(self, "Cloud connect failed", str(e)[:1500])
+            self.status.setText(f"Status: Cloud connect failed: {e}")
 
     def _logout(self):
         try:
@@ -414,7 +470,15 @@ class MainWindow(QMainWindow):
             return
         self._open_viewer(ip, int(port), int(ctrl) if ctrl else None)
 
-    def _open_viewer(self, ip: str, port: int, ctrl: int | None):
+    def _open_viewer(
+        self,
+        ip: str,
+        port: int,
+        ctrl: int | None,
+        *,
+        transport: str = "srt",
+        keep_alive: Optional[list] = None,
+    ):
         if self.viewer_win:
             try:
                 self.viewer_win.close()
@@ -422,19 +486,63 @@ class MainWindow(QMainWindow):
                 pass
             self.viewer_win = None
 
-        self._current_peer = {"ip": ip, "port": port, "ctrl": ctrl}
-        print(f"[ezpeek] Connecting → {ip} video={port} ctrl={ctrl}")
+        self._current_peer = {"ip": ip, "port": port, "ctrl": ctrl, "transport": transport}
+        print(f"[ezpeek] Connecting → {ip} video={port} ctrl={ctrl} tx={transport}")
         try:
-            self.viewer_win = ViewerWindow(ip, int(port), int(ctrl) if ctrl else None)
+            self.viewer_win = ViewerWindow(
+                ip,
+                int(port),
+                int(ctrl) if ctrl else None,
+                transport=transport,
+                keep_alive=keep_alive,
+            )
             self.viewer_win.show()
             self.viewer_win.raise_()
             self.viewer_win.activateWindow()
-            self.status.setText(f"Status: Viewing {ip}:{port}")
+            self.status.setText(f"Status: Viewing {ip}:{port} ({transport})")
         except Exception as e:
             import traceback
 
             traceback.print_exc()
             QMessageBox.warning(self, "Viewer failed", str(e))
+
+    def _open_viewer_via_cloud(self, friend_username: str, info: dict):
+        """
+        Full video + control over ezpeek-svr TCP reverse-proxy.
+        Clients only make outbound connections (no home firewall holes).
+        """
+        if not self.cloud or not self.cloud.token:
+            raise RuntimeError("not logged in")
+        relay = info.get("relay") or {}
+        server_url = self.cloud.base_url
+        # Local tunnels: ffmpeg/control connect to 127.0.0.1; tunnels dial cloud.
+        ctrl_tun = RelayViewerTunnel(
+            token=self.cloud.token,
+            friend_username=friend_username,
+            local_listen_port=_VIEW_CTRL_LOCAL,
+            channel="control",
+            server_url=server_url,
+            relay_host=relay.get("host") or "",
+            relay_port=int(relay.get("port") or 8788),
+        )
+        video_tun = RelayViewerTunnel(
+            token=self.cloud.token,
+            friend_username=friend_username,
+            local_listen_port=_VIEW_VIDEO_LOCAL,
+            channel="video",
+            server_url=server_url,
+            relay_host=relay.get("host") or "",
+            relay_port=int(relay.get("port") or 8788),
+        )
+        ctrl_tun.start()
+        video_tun.start()
+        self._open_viewer(
+            "127.0.0.1",
+            _VIEW_VIDEO_LOCAL,
+            _VIEW_CTRL_LOCAL,
+            transport="tcp",
+            keep_alive=[ctrl_tun, video_tun],
+        )
 
     def toggle_hosting(self) -> None:
         try:
@@ -486,19 +594,43 @@ class MainWindow(QMainWindow):
         if not self.cloud or not self.cloud.token:
             return
         self._stop_relay()
-        self._relay_agent = RelayHostAgent(
-            token=self.cloud.token,
-            local_ctrl_port=self.host.state.control_port or 2735,
-            server_url=self.cloud.base_url,
-            channel="control",
+        # Ensure dual-publish is on if we started hosting after login
+        if not self.host.cloud_tcp_publish:
+            self.host.cloud_tcp_publish = True
+        agents = []
+        # Control channel → local ControlServer
+        agents.append(
+            RelayHostAgent(
+                token=self.cloud.token,
+                local_port=self.host.state.control_port or 2735,
+                server_url=self.cloud.base_url,
+                channel="control",
+            )
         )
-        self._relay_agent.start()
-        print("[ezpeek] reverse-proxy host agent started → greenbird")
+        # Video channel → local FFmpeg TCP listen (twin of SRT)
+        agents.append(
+            RelayHostAgent(
+                token=self.cloud.token,
+                local_port=self.host.state.cloud_tcp_port or DEFAULT_CLOUD_TCP_PORT,
+                server_url=self.cloud.base_url,
+                channel="video",
+            )
+        )
+        for a in agents:
+            a.start()
+        self._relay_agents = agents
+        print(
+            f"[ezpeek] reverse-proxy host agents started "
+            f"(control+video) → {self.cloud.base_url}"
+        )
 
     def _stop_relay(self):
-        if self._relay_agent:
-            self._relay_agent.stop()
-            self._relay_agent = None
+        for a in self._relay_agents:
+            try:
+                a.stop()
+            except Exception:
+                pass
+        self._relay_agents = []
 
     def _poll_hosting(self):
         if self.host.state.proc is not None and self.host.state.proc.poll() is not None:

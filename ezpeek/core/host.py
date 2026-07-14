@@ -30,6 +30,7 @@ class HostState:
     port: int
     proc: subprocess.Popen | None = None
     control_port: int | None = None
+    cloud_tcp_port: int | None = None
     last_error: str = ""
     log_path: str = ""
     host_hz: float = 60.0
@@ -41,10 +42,16 @@ class HostState:
 
 
 class HostService:
-    """Hosts a LAN remote-desktop session (video SRT listener + control TCP)."""
+    """Hosts a LAN remote-desktop session (video SRT listener + control TCP).
+
+    When ``cloud_tcp_publish`` is True, also publishes the stream on
+    localhost TCP for the cloud reverse-proxy (clients need no inbound ports).
+    """
 
     DEFAULT_PORT = 2734
     DEFAULT_CONTROL_PORT = 2735
+    # Localhost TCP twin of the SRT stream — cloud reverse-proxy bridges this.
+    DEFAULT_CLOUD_TCP_PORT = 12734
     BIND_HOST = "0.0.0.0"
 
     def __init__(
@@ -59,6 +66,7 @@ class HostService:
         use_nat: bool = False,
         test_pattern: bool = False,
         host_hz: float | None = None,
+        cloud_tcp_publish: bool = False,
     ):
         self.host_hz = float(host_hz) if host_hz else get_display_refresh_hz()
         # Initial stream FPS = host panel rate until a client reports a lower rate.
@@ -71,6 +79,7 @@ class HostService:
         self.enable_control = enable_control
         self.use_nat = use_nat
         self.test_pattern = test_pattern
+        self.cloud_tcp_publish = cloud_tcp_publish
         self.peer_hz: Optional[float] = None
 
         self._control_server: ControlServer | None = None
@@ -88,6 +97,7 @@ class HostService:
             bitrate_min_kbps=self.bitrate_min_kbps,
             bitrate_max_kbps=self.bitrate_max_kbps,
             bitrate_target_kbps=self.bitrate_kbps,
+            cloud_tcp_port=self.DEFAULT_CLOUD_TCP_PORT if cloud_tcp_publish else None,
         )
         print(
             f"[ezpeek host] Local display refresh ≈ {self.host_hz:.2f} Hz → "
@@ -192,7 +202,14 @@ class HostService:
     def _launch_sender(self, pipewire_node_id: Optional[int]) -> None:
         capture = CaptureSpec(fps=self.fps)
         encode = self._build_encode_spec()
-        tx = TransportSpec(transport="srt", host=self.BIND_HOST, port=self.port)
+        cloud_port = self.DEFAULT_CLOUD_TCP_PORT if self.cloud_tcp_publish else None
+        self.state.cloud_tcp_port = cloud_port
+        tx = TransportSpec(
+            transport="srt",
+            host=self.BIND_HOST,
+            port=self.port,
+            cloud_tcp_port=cloud_port,
+        )
         cmd = build_sender_cmd(
             capture,
             encode,

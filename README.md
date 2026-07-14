@@ -18,8 +18,9 @@ Cross-platform focus: **Linux Wayland** and **Windows**, with real mouse/keyboar
 | **Windows host / view** | Working — gdigrab/d3d11grab where available; SendInput for control |
 | **Codecs** | **Auto:** probe real HW **AV1**, else HW/soft **H.264**. Default **CBR ~25 Mbps**. Stream FPS follows min(host refresh, client refresh) |
 | **Cloud auth + friends** | Working — login/register UI; server URL saved locally (no hardcoded default) |
-| **Cloud TCP relay** | Working — host & viewer dial out; server pairs control streams ([ezpeek-svr](https://github.com/RishiSpace/ezpeek-svr)) |
-| **Video over internet** | Prefer LAN SRT when peers share a network; full internet video path still evolving (STUN/TURN helpers live under `server/`) |
+| **Cloud TCP reverse-proxy** | Working — control **and video** over server TCP **8788** (both peers dial out; **no inbound ports on user PCs**) |
+| **STUN / TURN** | Working on **[ezpeek-svr](https://github.com/RishiSpace/ezpeek-svr)** (UDP **3478**); clients fetch config via `GET /ice` |
+| **Video over internet** | Same LAN → direct SRT; otherwise → cloud TCP video relay (+ STUN/TURN on the server for NAT helpers) |
 
 ---
 
@@ -39,17 +40,27 @@ Cross-platform focus: **Linux Wayland** and **Windows**, with real mouse/keyboar
 
 ## Cloud server → [ezpeek-svr](https://github.com/RishiSpace/ezpeek-svr)
 
-**Server-level hosting** (auth, friends, presence, TCP relay) is provided by the **[ezpeek-svr](https://github.com/RishiSpace/ezpeek-svr)** repository — not this client tree.
+**Server-level hosting** (auth, friends, presence, TCP reverse-proxy, STUN/TURN) is provided by the **[ezpeek-svr](https://github.com/RishiSpace/ezpeek-svr)** repository — not this client tree.
 
 | | |
 |---|---|
 | **Repo** | https://github.com/RishiSpace/ezpeek-svr |
-| **API** | TCP **8787** (HTTP: register/login/friends/presence) |
-| **Relay** | TCP **8788** (host ↔ viewer pairing) |
+| **API** | TCP **8787** (HTTP: register/login/friends/presence/**ice**) |
+| **TCP relay** | TCP **8788** (host ↔ viewer: **control** + **video** channels) |
+| **STUN/TURN** | UDP **3478** (+ optional high UDP range for TURN media) |
 
-Deploy that service on a VPS (or LAN box), open **8787/tcp** and **8788/tcp**, then point the ezpeek client at `http://YOUR_HOST:8787` on the sign-in screen. The URL is stored in `~/.config/ezpeek/settings.json` (Windows: under the user’s config path).
+### Why this matters for ports
 
-A copy of the cloud package and a **STUN/TURN** helper also live under [`server/`](server/) in this repo for local reference / optional NAT tooling. **Production cloud hosting should use [ezpeek-svr](https://github.com/RishiSpace/ezpeek-svr).**
+| Who | Ports to open |
+|-----|----------------|
+| **ezpeek-svr (VPS)** | **8787**, **8788**, **3478/udp** (and TURN media range if used) |
+| **User PCs (cloud mode)** | **None inbound** — only outbound to the server |
+
+Same-LAN sessions still use local UDP/TCP (discovery **27787**, SRT **2734**, control **2735**) for lowest latency; those are optional when both sides use cloud friends + relay.
+
+Deploy ezpeek-svr on a VPS, open the server ports above, then point the client at `http://YOUR_HOST:8787` on the sign-in screen. The URL is stored in `~/.config/ezpeek/settings.json`.
+
+A copy of the cloud package and STUN/TURN code also lives under [`server/`](server/) for local reference. **Production cloud hosting should use [ezpeek-svr](https://github.com/RishiSpace/ezpeek-svr).**
 
 ---
 
@@ -92,19 +103,20 @@ ffmpeg -protocols 2>/dev/null | grep -i srt
 | **2734** | UDP | Video (SRT) |
 | **2735** | TCP | Control / input |
 
-### Cloud client (outbound only)
+### Cloud client (outbound only — no inbound)
 
 | Port | Proto | Role |
 |------|--------|------|
-| **8787** | TCP | API |
-| **8788** | TCP | Relay |
+| **8787** | TCP | API (+ `/ice`) |
+| **8788** | TCP | Control + video reverse-proxy |
+| **3478** | UDP | STUN/TURN (outbound to server) |
 
-### Optional STUN/TURN server (if you run one)
+### Server STUN/TURN (on the VPS, not on users)
 
 | Port | Proto | Role |
 |------|--------|------|
-| **3478** | UDP | STUN/TURN |
-| **49152–65535** | UDP | TURN relay range (when TURN enabled) |
+| **3478** | UDP | STUN + TURN |
+| **49152–65535** | UDP | TURN media range (when TURN used) |
 
 ---
 
@@ -140,9 +152,11 @@ ezpeek --test-pattern
 
 ## Quick start (with cloud friends)
 
-1. Deploy **[ezpeek-svr](https://github.com/RishiSpace/ezpeek-svr)** and open **8787** + **8788**.
+1. Deploy **[ezpeek-svr](https://github.com/RishiSpace/ezpeek-svr)** and open **8787**, **8788**, and **3478/udp** (server only).
 2. On each client, run `ezpeek` → enter **Server URL** (e.g. `http://YOUR_HOST:8787`) → register / log in.
-3. Add friends by username; host and connect via the friends / presence UI when available on LAN, or use the relay for control rendezvous.
+3. Add friends by username.
+4. Friend A: **H** to host (also starts outbound control+video relay agents).
+5. Friend B: **Connect** — if not on the same LAN, ezpeek uses the **cloud TCP path** for video + input (no ports to open at home).
 
 ---
 
@@ -178,13 +192,19 @@ SRT latency is tuned for low delay (~20 ms target range; exact values in transpo
 ## Architecture
 
 ```
-[Host]  capture → FFmpeg encode (AV1/H.264 CBR) → SRT listen :2734
-        ControlServer TCP :2735  ← mouse/keyboard
+[Host]  capture → FFmpeg encode (AV1/H.264 CBR)
+          ├─ SRT listen :2734          (LAN peers)
+          └─ TCP listen 127.0.0.1:12734 (cloud twin)
+        ControlServer TCP :2735
+        Outbound agents → ezpeek-svr :8788 (HOST control + HOST video)
 
-[Viewer] FFmpeg decode (SRT caller) → Qt ViewerWindow
-         ControlClient → TCP :2735
+[Viewer LAN]   SRT caller → host:2734 · control → host:2735
 
-[Optional cloud]  ezpeek-svr  :8787 API  +  :8788 TCP relay
+[Viewer cloud] Local tunnels 127.0.0.1:12734 / :12735
+               dial VIEW on ezpeek-svr :8788 → paired to host agents
+               FFmpeg TCP decode + ControlClient → localhost tunnels
+
+[ezpeek-svr]  :8787 API  ·  :8788 TCP relay  ·  :3478 STUN/TURN
 ```
 
 Modules: `ezpeek/core/{capture,encoder,transport,control,discovery,host,viewer,…}`, `ezpeek/gui/`, `ezpeek/cloud/`.

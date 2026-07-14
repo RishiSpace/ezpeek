@@ -315,13 +315,23 @@ class ViewerWindow(QMainWindow):
         video_port: int,
         ctrl_port: int | None = None,
         parent=None,
+        *,
+        transport: str = "srt",
+        keep_alive: Optional[list] = None,
     ):
+        """
+        transport: "srt" (LAN) or "tcp" (cloud reverse-proxy local tunnel).
+        keep_alive: optional objects (e.g. RelayViewerTunnel) held until window closes.
+        """
         super().__init__(parent)
         self.host_ip = host_ip
         self.video_port = video_port
         self.ctrl_port = ctrl_port
+        self.transport = transport if transport in ("srt", "tcp") else "srt"
+        self._keep_alive = list(keep_alive or [])
 
-        self.setWindowTitle(f"EzPeek — {host_ip}:{video_port}")
+        mode = "cloud-tcp" if self.transport == "tcp" else "srt"
+        self.setWindowTitle(f"EzPeek — {host_ip}:{video_port} ({mode})")
         self.setMinimumSize(960, 540)
         self.resize(1280, 720)
 
@@ -331,7 +341,10 @@ class ViewerWindow(QMainWindow):
         self._reader: Optional[_MjpegReader] = None
 
         self.local_hz = get_display_refresh_hz()
-        print(f"[ezpeek viewer] Local display refresh ≈ {self.local_hz:.2f} Hz")
+        print(
+            f"[ezpeek viewer] Local display refresh ≈ {self.local_hz:.2f} Hz "
+            f"tx={self.transport} → {host_ip}:{video_port}"
+        )
 
         self._build_ui()
         # Control first (sends CLIENT_CAPS → host may restart encoder at min FPS).
@@ -341,7 +354,8 @@ class ViewerWindow(QMainWindow):
             (self.status_label.text() or "Control…")
             + " · waiting for host stream…"
         )
-        QTimer.singleShot(1800, self._start_video)
+        delay = 800 if self.transport == "tcp" else 1800
+        QTimer.singleShot(delay, self._start_video)
 
     def _build_ui(self):
         central = QWidget()
@@ -398,7 +412,10 @@ class ViewerWindow(QMainWindow):
         try:
             # Software decode by default — more reliable across Windows/Linux codecs.
             cmd = build_integrated_decode_cmd(
-                self.host_ip, int(self.video_port), use_hwaccel=False
+                self.host_ip,
+                int(self.video_port),
+                use_hwaccel=False,
+                transport=self.transport,
             )
         except Exception as e:
             self.status_label.setText(f"Decoder setup failed: {e}")
@@ -410,9 +427,10 @@ class ViewerWindow(QMainWindow):
         self._thread.started.connect(self._reader.run)
         self._reader.frame.connect(self._on_frame)
         self._reader.failed.connect(self._on_decode_fail)
+        scheme = "tcp" if self.transport == "tcp" else "srt"
         self._reader.started_ok.connect(
             lambda: self.status_label.setText(
-                f"Connecting to srt://{self.host_ip}:{self.video_port} …"
+                f"Connecting to {scheme}://{self.host_ip}:{self.video_port} …"
             )
         )
         self._thread.start()
@@ -490,4 +508,10 @@ class ViewerWindow(QMainWindow):
             self.control.close()
         except Exception:
             pass
+        for obj in self._keep_alive:
+            try:
+                obj.stop()
+            except Exception:
+                pass
+        self._keep_alive.clear()
         super().closeEvent(event)

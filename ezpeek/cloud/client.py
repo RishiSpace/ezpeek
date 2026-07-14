@@ -128,26 +128,35 @@ class CloudClient:
     def friend_connect(self, username: str) -> dict:
         return self._request("GET", f"/friends/{username}/connect", auth=True)
 
+    def ice(self) -> dict:
+        """STUN/TURN + TCP relay endpoints (auth). Clients need no inbound ports."""
+        return self._request("GET", "/ice", auth=True)
+
 
 class RelayHostAgent:
     """
-    Maintains outbound TCP to greenbird so viewers can reverse-proxy in.
-    Currently bridges the *control* channel; video still prefers LAN SRT.
+    Outbound TCP to ezpeek-svr so viewers can reverse-proxy in.
+
+    After the server pairs a viewer, bridges the relay socket to a *local*
+    service (control TCP server or FFmpeg TCP listen for video).
+    No inbound ports required on the host's WAN interface.
     """
 
     def __init__(
         self,
         token: str,
-        local_ctrl_port: int = 2735,
+        local_port: int = 2735,
         relay_host: str = "",
         relay_port: int = DEFAULT_RELAY_PORT,
         channel: str = "control",
         server_url: str = "",
+        *,
+        local_ctrl_port: Optional[int] = None,  # backward-compat alias
     ):
         if not relay_host and server_url:
             relay_host, relay_port = relay_endpoint_from_server_url(server_url)
         self.token = token
-        self.local_ctrl_port = local_ctrl_port
+        self.local_port = int(local_ctrl_port if local_ctrl_port is not None else local_port)
         self.relay_host = relay_host
         self.relay_port = relay_port
         self.channel = channel
@@ -158,7 +167,9 @@ class RelayHostAgent:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True, name="ezpeek-relay-host")
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=f"ezpeek-relay-host-{self.channel}"
+        )
         self._thread.start()
 
     def stop(self):
@@ -169,18 +180,21 @@ class RelayHostAgent:
             try:
                 self._session()
             except Exception as e:
-                print(f"[ezpeek relay] host session error: {e}")
+                print(f"[ezpeek relay] host/{self.channel} session error: {e}")
             if self._stop.is_set():
                 break
             self._stop.wait(3.0)
 
     def _session(self):
-        print(f"[ezpeek relay] connecting to {self.relay_host}:{self.relay_port} as HOST…")
+        print(
+            f"[ezpeek relay] HOST {self.channel} → {self.relay_host}:{self.relay_port} "
+            f"(local :{self.local_port})"
+        )
         sock = socket.create_connection((self.relay_host, self.relay_port), timeout=20)
         sock.settimeout(120)
         sock.sendall(f"HOST {self.token} {self.channel}\n".encode())
         line = _recv_line(sock)
-        print(f"[ezpeek relay] server: {line}")
+        print(f"[ezpeek relay] host/{self.channel}: {line}")
         if not line.startswith("OK"):
             sock.close()
             raise RuntimeError(line)
@@ -191,14 +205,26 @@ class RelayHostAgent:
                 line = _recv_line(sock)
             except socket.timeout:
                 continue
-            print(f"[ezpeek relay] {line}")
+            print(f"[ezpeek relay] host/{self.channel}: {line}")
             if "PAIRED" in line:
                 break
             if line.startswith("ERR"):
                 sock.close()
                 raise RuntimeError(line)
-        # Bridge to local control server
-        local = socket.create_connection(("127.0.0.1", self.local_ctrl_port), timeout=5)
+        # Bridge to local service (control server or FFmpeg TCP listen)
+        local = None
+        for attempt in range(20):
+            if self._stop.is_set():
+                sock.close()
+                return
+            try:
+                local = socket.create_connection(("127.0.0.1", self.local_port), timeout=2)
+                break
+            except OSError:
+                self._stop.wait(0.5)
+        if local is None:
+            sock.close()
+            raise RuntimeError(f"local {self.channel} port {self.local_port} not ready")
         _pipe_sockets(sock, local)
         try:
             sock.close()
@@ -211,7 +237,12 @@ class RelayHostAgent:
 
 
 class RelayViewerTunnel:
-    """Open a reverse-proxy control tunnel to a friend's host via greenbird."""
+    """
+    Local TCP listen that bridges the first client through ezpeek-svr to a friend.
+
+    Used for both control (default :12735) and video (:12734). Viewer/ffmpeg
+    connect to localhost; no WAN inbound ports on the client.
+    """
 
     def __init__(
         self,
@@ -234,11 +265,17 @@ class RelayViewerTunnel:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._server: Optional[socket.socket] = None
+        self.ready = threading.Event()
 
     def start(self):
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True, name="ezpeek-relay-view")
+        self.ready.clear()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=f"ezpeek-relay-view-{self.channel}"
+        )
         self._thread.start()
+        # Wait until local listen is up
+        self.ready.wait(timeout=5.0)
 
     def stop(self):
         self._stop.set()
@@ -253,10 +290,14 @@ class RelayViewerTunnel:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("127.0.0.1", self.local_listen_port))
-        srv.listen(1)
+        srv.listen(2)
         srv.settimeout(1.0)
         self._server = srv
-        print(f"[ezpeek relay] viewer local listen 127.0.0.1:{self.local_listen_port}")
+        self.ready.set()
+        print(
+            f"[ezpeek relay] VIEW {self.channel} listen 127.0.0.1:{self.local_listen_port} "
+            f"→ {self.relay_host}:{self.relay_port} friend=@{self.friend_username}"
+        )
         while not self._stop.is_set():
             try:
                 client, _ = srv.accept()
@@ -268,7 +309,7 @@ class RelayViewerTunnel:
                     f"VIEW {self.token} {self.friend_username} {self.channel}\n".encode()
                 )
                 line = _recv_line(remote)
-                print(f"[ezpeek relay] view: {line}")
+                print(f"[ezpeek relay] view/{self.channel}: {line}")
                 if not line.startswith("OK"):
                     client.close()
                     remote.close()
@@ -276,7 +317,7 @@ class RelayViewerTunnel:
                 # may get OK VIEW pairing then data — host sends OK PAIRED on its side
                 _pipe_sockets(client, remote)
             except Exception as e:
-                print(f"[ezpeek relay] view bridge error: {e}")
+                print(f"[ezpeek relay] view/{self.channel} bridge error: {e}")
             finally:
                 try:
                     client.close()
