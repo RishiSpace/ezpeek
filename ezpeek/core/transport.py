@@ -19,7 +19,7 @@ Transport = Literal["srt", "tcp"]
 
 # LAN-friendly defaults. 20ms was too aggressive and caused flaky connects.
 DEFAULT_SRT_LATENCY_MS = 120
-# Localhost TCP publish for cloud reverse-proxy (no inbound ports on the WAN).
+# Viewer-side local TCP port for cloud reverse-proxy tunnels.
 DEFAULT_CLOUD_TCP_PORT = 12734
 
 
@@ -31,8 +31,6 @@ class TransportSpec:
     host: str = "0.0.0.0"
     port: int = 2734
     latency_ms: int = DEFAULT_SRT_LATENCY_MS
-    # When set, also publish the same stream on localhost TCP for cloud relay.
-    cloud_tcp_port: Optional[int] = None
 
 
 def srt_url(
@@ -230,17 +228,18 @@ def build_sender_cmd(
     mux_fmt = mux_format_for_family(family)
     print(f"[ezpeek] Stream mux format: {mux_fmt} (codec family={family}, encoder={_enc_name})")
 
-    # Bind on all interfaces so LAN peers can connect regardless of which IP we advertise.
+    # Single SRT listener only. Cloud video is re-muxed from this stream after
+    # relay pairing (see RelayHostAgent video mode) — dual tee+tcp listen was
+    # breaking Windows/Linux host with "Invalid argument" / I/O errors.
     bind_host = tx.host if tx.host not in ("", None) else "0.0.0.0"
-    srt_out = srt_url(
+    out_url = srt_url(
         bind_host,
         tx.port,
         mode="listener",
         latency_ms=tx.latency_ms,
         extra="snddropdelay=0",
     )
-    # Dual-publish: SRT for LAN + localhost TCP for cloud reverse-proxy (no client ports).
-    out_args = _build_output_args(mux_fmt, srt_out, tx.cloud_tcp_port)
+    out_args = ["-f", mux_fmt, out_url]
 
     # Synthetic pattern for self-test / debugging without screen capture permissions.
     if test_pattern:
@@ -271,7 +270,10 @@ def build_sender_cmd(
             if _is_wayland() and not _check_ffmpeg_pipewire_support():
                 fr = str(capture.fps)
                 encode_part = " ".join(build_video_encode_args(encode))
-                out_shell = _output_args_shell(out_args)
+                out_shell = " ".join(
+                    ("'" + a.replace("'", "'\\''") + "'") if any(c in a for c in " |&;<>()$`\\\"'") else a
+                    for a in out_args
+                )
                 if _has_wl_screenrec():
                     wl_part = f"wl-screenrec --fps {fr} -c h264 --ffmpeg-muxer mpegts -o -"
                     pipeline = (
@@ -316,46 +318,22 @@ def build_sender_cmd(
 
     input_args = build_capture_input_args(capture)
 
+    # probesize: tiny values make gdigrab spam "not enough frames to estimate rate"
+    # and can fluke mux setup; keep low-latency but not extreme.
     cmd = [
         ffmpeg_exe,
         "-hide_banner",
         "-loglevel", "warning",
         "-fflags", "nobuffer",
         "-flags", "low_delay",
-        "-probesize", "32",
-        "-analyzeduration", "0",
+        "-probesize", "1000000",
+        "-analyzeduration", "500000",
         "-thread_queue_size", "512",
     ]
     cmd += input_args
     cmd += build_video_encode_args(encode)
     cmd += out_args
     return cmd
-
-
-def _build_output_args(mux_fmt: str, srt_url_str: str, cloud_tcp_port: Optional[int]) -> list[str]:
-    """SRT listener, optional dual-publish to localhost TCP for cloud relay."""
-    if not cloud_tcp_port:
-        return ["-f", mux_fmt, srt_url_str]
-    # ffmpeg tee: escape : and \ in URLs carefully
-    tcp_url = f"tcp://127.0.0.1:{int(cloud_tcp_port)}?listen=1"
-    # Use onfail=ignore so one path dying doesn't kill the other.
-    tee = (
-        f"[f={mux_fmt}:onfail=ignore]{srt_url_str}|"
-        f"[f={mux_fmt}:onfail=ignore]{tcp_url}"
-    )
-    print(f"[ezpeek] Dual publish: SRT LAN + TCP cloud localhost:{cloud_tcp_port}")
-    return ["-f", "tee", tee]
-
-
-def _output_args_shell(out_args: list[str]) -> str:
-    """Shell-quote output args for sh -c pipelines."""
-    parts = []
-    for a in out_args:
-        if any(c in a for c in " |&;<>()$`\\\"'"):
-            parts.append("'" + a.replace("'", "'\\''") + "'")
-        else:
-            parts.append(a)
-    return " ".join(parts)
 
 
 def _get_supported_hwaccels() -> str:

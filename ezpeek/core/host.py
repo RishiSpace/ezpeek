@@ -24,13 +24,48 @@ from .nat_traversal import get_best_connection_address
 from .transport import TransportSpec, build_sender_cmd
 
 
+def _try_free_udp_port(port: int) -> None:
+    """Best-effort free of a stuck SRT listener (zombie ffmpeg)."""
+    try:
+        if platform.system().lower() == "windows":
+            # Find PIDs listening on UDP port via netstat (best-effort).
+            p = subprocess.run(
+                ["netstat", "-ano", "-p", "udp"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            for line in (p.stdout or "").splitlines():
+                if f":{port}" in line and "UDP" in line.upper():
+                    parts = line.split()
+                    pid = parts[-1] if parts else ""
+                    if pid.isdigit() and int(pid) > 0:
+                        subprocess.run(
+                            ["taskkill", "/F", "/PID", pid],
+                            capture_output=True,
+                            check=False,
+                            timeout=5,
+                        )
+                        print(f"[ezpeek host] Freed UDP {port} (killed pid {pid})")
+        else:
+            # fuser is common; ignore if missing.
+            subprocess.run(
+                ["fuser", "-k", f"{port}/udp"],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+    except Exception as e:
+        print(f"[ezpeek host] port free skipped: {e}")
+
+
 @dataclass
 class HostState:
     host_ip: str
     port: int
     proc: subprocess.Popen | None = None
     control_port: int | None = None
-    cloud_tcp_port: int | None = None
     last_error: str = ""
     log_path: str = ""
     host_hz: float = 60.0
@@ -42,16 +77,10 @@ class HostState:
 
 
 class HostService:
-    """Hosts a LAN remote-desktop session (video SRT listener + control TCP).
-
-    When ``cloud_tcp_publish`` is True, also publishes the stream on
-    localhost TCP for the cloud reverse-proxy (clients need no inbound ports).
-    """
+    """Hosts a LAN remote-desktop session (video SRT listener + control TCP)."""
 
     DEFAULT_PORT = 2734
     DEFAULT_CONTROL_PORT = 2735
-    # Localhost TCP twin of the SRT stream — cloud reverse-proxy bridges this.
-    DEFAULT_CLOUD_TCP_PORT = 12734
     BIND_HOST = "0.0.0.0"
 
     def __init__(
@@ -66,7 +95,7 @@ class HostService:
         use_nat: bool = False,
         test_pattern: bool = False,
         host_hz: float | None = None,
-        cloud_tcp_publish: bool = False,
+        cloud_tcp_publish: bool = False,  # kept for API compat; cloud uses SRT re-mux
     ):
         self.host_hz = float(host_hz) if host_hz else get_display_refresh_hz()
         # Initial stream FPS = host panel rate until a client reports a lower rate.
@@ -97,7 +126,6 @@ class HostService:
             bitrate_min_kbps=self.bitrate_min_kbps,
             bitrate_max_kbps=self.bitrate_max_kbps,
             bitrate_target_kbps=self.bitrate_kbps,
-            cloud_tcp_port=self.DEFAULT_CLOUD_TCP_PORT if cloud_tcp_publish else None,
         )
         print(
             f"[ezpeek host] Local display refresh ≈ {self.host_hz:.2f} Hz → "
@@ -202,13 +230,10 @@ class HostService:
     def _launch_sender(self, pipewire_node_id: Optional[int]) -> None:
         capture = CaptureSpec(fps=self.fps)
         encode = self._build_encode_spec()
-        cloud_port = self.DEFAULT_CLOUD_TCP_PORT if self.cloud_tcp_publish else None
-        self.state.cloud_tcp_port = cloud_port
         tx = TransportSpec(
             transport="srt",
             host=self.BIND_HOST,
             port=self.port,
-            cloud_tcp_port=cloud_port,
         )
         cmd = build_sender_cmd(
             capture,
@@ -283,6 +308,10 @@ class HostService:
         self.state.host_ip = get_local_ip()
         self.state.host_hz = self.host_hz
         self.state.stream_fps = self.fps
+
+        # Avoid "Address already in use" from a previous crashed sender.
+        self._stop_sender_only()
+        _try_free_udp_port(self.port)
 
         if self.use_nat:
             try:

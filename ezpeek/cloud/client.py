@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Optional
@@ -137,9 +138,11 @@ class RelayHostAgent:
     """
     Outbound TCP to ezpeek-svr so viewers can reverse-proxy in.
 
-    After the server pairs a viewer, bridges the relay socket to a *local*
-    service (control TCP server or FFmpeg TCP listen for video).
-    No inbound ports required on the host's WAN interface.
+    After the server pairs a viewer:
+      - control: bridge relay ↔ local ControlServer TCP
+      - video:   ffmpeg pulls local SRT listener and writes stream bytes to relay
+
+    No dual FFmpeg tee / no inbound ports on the host WAN interface.
     """
 
     def __init__(
@@ -152,6 +155,8 @@ class RelayHostAgent:
         server_url: str = "",
         *,
         local_ctrl_port: Optional[int] = None,  # backward-compat alias
+        srt_port: int = 2734,
+        video_source: str = "tcp",  # "tcp" (legacy) or "srt" (cloud video)
     ):
         if not relay_host and server_url:
             relay_host, relay_port = relay_endpoint_from_server_url(server_url)
@@ -160,8 +165,14 @@ class RelayHostAgent:
         self.relay_host = relay_host
         self.relay_port = relay_port
         self.channel = channel
+        self.srt_port = int(srt_port)
+        # Video channel defaults to SRT re-mux (safe with AV1 matroska + H.264 mpegts).
+        if channel == "video" and video_source == "tcp":
+            video_source = "srt"
+        self.video_source = video_source
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._ffmpeg = None  # subprocess.Popen when video remux is active
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -174,6 +185,22 @@ class RelayHostAgent:
 
     def stop(self):
         self._stop.set()
+        self._kill_ffmpeg()
+
+    def _kill_ffmpeg(self):
+        p = self._ffmpeg
+        self._ffmpeg = None
+        if not p:
+            return
+        try:
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=2)
+                except Exception:
+                    p.kill()
+        except Exception:
+            pass
 
     def _run(self):
         while not self._stop.is_set():
@@ -181,14 +208,16 @@ class RelayHostAgent:
                 self._session()
             except Exception as e:
                 print(f"[ezpeek relay] host/{self.channel} session error: {e}")
+            self._kill_ffmpeg()
             if self._stop.is_set():
                 break
             self._stop.wait(3.0)
 
     def _session(self):
+        src = f"srt:{self.srt_port}" if (self.channel == "video" and self.video_source == "srt") else f"tcp:{self.local_port}"
         print(
             f"[ezpeek relay] HOST {self.channel} → {self.relay_host}:{self.relay_port} "
-            f"(local :{self.local_port})"
+            f"(source {src})"
         )
         sock = socket.create_connection((self.relay_host, self.relay_port), timeout=20)
         sock.settimeout(120)
@@ -211,9 +240,15 @@ class RelayHostAgent:
             if line.startswith("ERR"):
                 sock.close()
                 raise RuntimeError(line)
-        # Bridge to local service (control server or FFmpeg TCP listen)
+
+        if self.channel == "video" and self.video_source == "srt":
+            self._bridge_srt_to_relay(sock)
+        else:
+            self._bridge_local_tcp_to_relay(sock)
+
+    def _bridge_local_tcp_to_relay(self, sock: socket.socket):
         local = None
-        for attempt in range(20):
+        for _ in range(20):
             if self._stop.is_set():
                 sock.close()
                 return
@@ -234,6 +269,99 @@ class RelayHostAgent:
             local.close()
         except Exception:
             pass
+
+    def _bridge_srt_to_relay(self, sock: socket.socket):
+        """
+        After pairing: pull host SRT (already listening for LAN) and stream
+        container bytes to the cloud TCP relay. Viewer reads via local tunnel.
+        """
+        import subprocess
+
+        from ezpeek.core.transport import (
+            DEFAULT_SRT_LATENCY_MS,
+            ensure_ffmpeg_tools,
+            srt_url,
+            _find_ffmpeg_executables,
+        )
+
+        ensure_ffmpeg_tools()
+        ffmpeg, _ = _find_ffmpeg_executables()
+        url = srt_url(
+            "127.0.0.1",
+            self.srt_port,
+            mode="caller",
+            latency_ms=DEFAULT_SRT_LATENCY_MS,
+            extra="rcvlatency=0",
+        )
+        # matroska carries H.264 and AV1; mpegts alone fails for AV1.
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-fflags", "nobuffer+discardcorrupt",
+            "-flags", "low_delay",
+            "-i", url,
+            "-c", "copy",
+            "-f", "matroska",
+            "pipe:1",
+        ]
+        print(f"[ezpeek relay] video remux: {' '.join(cmd)}")
+        # Wait briefly for host SRT listener to accept
+        last_err = ""
+        proc = None
+        for attempt in range(15):
+            if self._stop.is_set():
+                sock.close()
+                return
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=0,
+                )
+                # If it dies immediately, retry
+                time.sleep(0.4)
+                if proc.poll() is None:
+                    break
+                err = (proc.stderr.read() if proc.stderr else b"")[:400]
+                last_err = err.decode(errors="ignore")
+                proc = None
+            except Exception as e:
+                last_err = str(e)
+            self._stop.wait(0.6)
+        if proc is None or proc.stdout is None:
+            sock.close()
+            raise RuntimeError(f"SRT remux failed: {last_err or 'no process'}")
+
+        self._ffmpeg = proc
+
+        def _drain_err():
+            try:
+                assert proc and proc.stderr
+                while not self._stop.is_set():
+                    chunk = proc.stderr.read(512)
+                    if not chunk:
+                        break
+            except Exception:
+                pass
+
+        threading.Thread(target=_drain_err, daemon=True).start()
+
+        try:
+            while not self._stop.is_set():
+                data = proc.stdout.read(65536)
+                if not data:
+                    break
+                sock.sendall(data)
+        except Exception as e:
+            print(f"[ezpeek relay] video pipe end: {e}")
+        finally:
+            self._kill_ffmpeg()
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 class RelayViewerTunnel:

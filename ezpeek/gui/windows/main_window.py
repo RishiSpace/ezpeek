@@ -25,7 +25,6 @@ from ...cloud.client import RelayHostAgent, RelayViewerTunnel
 from ...core.discovery import DiscoveryService
 from ...core.encoder import describe_encode_choice, EncodeSpec
 from ...core.host import HostService
-from ...core.transport import DEFAULT_CLOUD_TCP_PORT
 from ...utils import (
     BITRATE_MAX_KBPS,
     BITRATE_MIN_KBPS,
@@ -594,9 +593,6 @@ class MainWindow(QMainWindow):
         if not self.cloud or not self.cloud.token:
             return
         self._stop_relay()
-        # Ensure dual-publish is on if we started hosting after login
-        if not self.host.cloud_tcp_publish:
-            self.host.cloud_tcp_publish = True
         agents = []
         # Control channel → local ControlServer
         agents.append(
@@ -607,13 +603,16 @@ class MainWindow(QMainWindow):
                 channel="control",
             )
         )
-        # Video channel → local FFmpeg TCP listen (twin of SRT)
+        # Video channel → remux local SRT listener into cloud TCP relay
+        # (no dual tee / no localhost TCP listen on the host encoder)
         agents.append(
             RelayHostAgent(
                 token=self.cloud.token,
-                local_port=self.host.state.cloud_tcp_port or DEFAULT_CLOUD_TCP_PORT,
+                local_port=0,
                 server_url=self.cloud.base_url,
                 channel="video",
+                srt_port=self.host.state.port or 2734,
+                video_source="srt",
             )
         )
         for a in agents:
@@ -621,7 +620,7 @@ class MainWindow(QMainWindow):
         self._relay_agents = agents
         print(
             f"[ezpeek] reverse-proxy host agents started "
-            f"(control+video) → {self.cloud.base_url}"
+            f"(control+video/SRT-remux) → {self.cloud.base_url}"
         )
 
     def _stop_relay(self):
