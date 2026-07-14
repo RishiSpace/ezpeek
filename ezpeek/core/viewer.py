@@ -35,19 +35,20 @@ def build_integrated_decode_cmd(
     *,
     latency_ms: int = DEFAULT_SRT_LATENCY_MS,
     max_width: int = 1920,
+    use_hwaccel: bool = False,
 ) -> list[str]:
     """
     Decode SRT stream to an MJPEG pipe for the integrated Qt viewer.
 
-    MJPEG is self-describing (resolution in each frame) and easy to parse from a pipe.
-    Hardware decode is used when ffmpeg supports it (-hwaccel).
+    Default is *software* decode (libdav1d / native). HW accel is optional because
+    d3d11va/cuda often hang or fail on mixed AV1/H.264 LAN streams and leave the
+    UI stuck on "Connecting…".
     """
     ensure_ffmpeg_tools()
     ffmpeg_exe, _ = _find_ffmpeg_executables()
     if not has_srt_support():
         raise RuntimeError("FFmpeg has no SRT support")
 
-    hw = _get_hwaccel_arg()
     srt = srt_url(host, port, mode="caller", latency_ms=latency_ms, extra="rcvlatency=0")
 
     cmd = [
@@ -56,22 +57,21 @@ def build_integrated_decode_cmd(
         "-loglevel", "warning",
         "-fflags", "nobuffer+discardcorrupt",
         "-flags", "low_delay",
-        # Matroska/AV1 needs a bit more probe than bare MPEG-TS.
-        "-probesize", "500000",
-        "-analyzeduration", "500000",
+        "-probesize", "1000000",
+        "-analyzeduration", "1000000",
+        "-rw_timeout", "5000000",  # 5s I/O timeout (microseconds) where supported
     ]
-    # Prefer software libdav1d for AV1 if HW accel misbehaves; still pass hw when useful for H.264.
-    cmd += hw
+    if use_hwaccel:
+        cmd += _get_hwaccel_arg()
     cmd += [
         "-i", srt,
-        # Slight downscale cap for UI smoothness on huge desktops; keep aspect.
         "-vf", f"scale='min({max_width},iw)':-2",
         "-an",
         "-f", "mjpeg",
         "-q:v", "5",
         "pipe:1",
     ]
-    print(f"[ezpeek viewer] integrated decode cmd: {cmd}")
+    print(f"[ezpeek viewer] integrated decode cmd (hw={use_hwaccel}): {cmd}")
     return cmd
 
 

@@ -3,37 +3,50 @@ from __future__ import annotations
 import socket
 import threading
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, Set
 
 from ezpeek.utils import get_local_ip
-
-
-def _get_subnet_broadcast(ip: str) -> Optional[str]:
-    """Best-effort /24 broadcast for the given IP (common for home/LAN routers)."""
-    if not ip or ip == "0.0.0.0":
-        return None
-    try:
-        parts = ip.split(".")
-        if len(parts) == 4:
-            return f"{parts[0]}.{parts[1]}.{parts[2]}.255"
-    except Exception:
-        pass
-    return None
 
 
 BROADCAST_PORT = 27787
 MAGIC = "EZPEEK_HELLO"
 
 
+def _broadcast_targets(ip: str) -> list[str]:
+    """
+    Destinations for discovery UDP.
+
+    Important: we used to only add a /24 directed broadcast (x.y.z.255).
+    On a /16 LAN (e.g. Linux 10.0.0.3/16 and Windows 10.0.7.x) that NEVER
+    reaches the other host. Include /16 and /8 candidates + limited broadcast.
+    """
+    dests = ["<broadcast>", "255.255.255.255"]
+    if not ip or ip == "0.0.0.0":
+        return dests
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return dests
+    try:
+        a, b, c, _d = (int(x) for x in parts)
+    except ValueError:
+        return dests
+    # /24, /16, /8 directed broadcasts (harmless if unused)
+    dests.append(f"{a}.{b}.{c}.255")
+    dests.append(f"{a}.{b}.255.255")
+    dests.append(f"{a}.255.255.255")
+    return dests
+
+
 class DiscoveryService:
     """
-    LAN peer discovery via UDP broadcast.
+    LAN peer discovery via UDP broadcast + unicast replies.
 
     Packet format:
       EZPEEK_HELLO|<hostname>|<ip>|<video_port>|<ctrl_port>|<refresh_hz>
 
-    Empty video/ctrl fields mean the peer is online but not hosting.
-    refresh_hz is the peer's primary display refresh rate (for FPS negotiation).
+    When we *receive* a peer hello, we unicast our hello back to the sender.
+    That fixes asymmetric cases (Windows receives limited broadcasts from Linux
+    but Linux never sees Windows' /24-only directed broadcasts).
     """
 
     def __init__(
@@ -41,16 +54,15 @@ class DiscoveryService:
         on_peer_found: Optional[Callable] = None,
         get_advertisement: Optional[Callable] = None,
     ):
-        """
-        on_peer_found: callback(name, ip, port|None, ctrl_port=None, refresh_hz=None)
-        get_advertisement: callable returning dict e.g. {"port": 2734, "ctrl": 2735, "hz": 144}
-        """
         self.on_peer_found = on_peer_found
         self.get_advertisement = get_advertisement
         self.running = False
         # ip -> last advertised (port, ctrl, hz)
         self._last: dict[str, tuple[Optional[int], Optional[int], Optional[float]]] = {}
+        # Peers we unicast to on each tick (source IPs that talked to us)
+        self._known_peers: Set[str] = set()
         self._my_ip = get_local_ip()
+        self._lock = threading.Lock()
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -66,7 +78,10 @@ class DiscoveryService:
         self.running = True
         threading.Thread(target=self._listener, daemon=True, name="ezpeek-discovery-listen").start()
         threading.Thread(target=self._broadcaster, daemon=True, name="ezpeek-discovery-bcast").start()
-        print(f"[ezpeek] Discovery started on UDP {BROADCAST_PORT} (my_ip={self._my_ip})")
+        print(
+            f"[ezpeek] Discovery started on UDP {BROADCAST_PORT} "
+            f"(my_ip={self._my_ip}, bcast targets={_broadcast_targets(self._my_ip)})"
+        )
 
     def stop(self):
         self.running = False
@@ -76,7 +91,6 @@ class DiscoveryService:
             pass
 
     def _build_message(self) -> str:
-        # Refresh local IP occasionally (DHCP / interface changes).
         try:
             self._my_ip = get_local_ip()
         except Exception:
@@ -92,20 +106,23 @@ class DiscoveryService:
         hz = adv.get("hz") or adv.get("refresh") or ""
         return f"{MAGIC}|{socket.gethostname()}|{self._my_ip}|{video_port}|{ctrl}|{hz}"
 
-    def _send_message(self, message: str) -> None:
+    def _send_message(self, message: str, extra_unicast: Optional[list[str]] = None) -> None:
         msg = message.encode()
-        dests = ["<broadcast>", "255.255.255.255"]
-        bcast = _get_subnet_broadcast(self._my_ip)
-        if bcast:
-            dests.append(bcast)
-        for bcast_addr in set(dests):
+        dests = set(_broadcast_targets(self._my_ip))
+        with self._lock:
+            peers = list(self._known_peers)
+        for peer in peers:
+            dests.add(peer)
+        if extra_unicast:
+            dests.update(extra_unicast)
+
+        for dest in dests:
             try:
-                self.sock.sendto(msg, (bcast_addr, BROADCAST_PORT))
+                self.sock.sendto(msg, (dest, BROADCAST_PORT))
             except Exception:
                 pass
 
     def force_broadcast(self):
-        """Immediately send one discovery packet (e.g. after hosting starts)."""
         if not self.running:
             return
         try:
@@ -123,7 +140,6 @@ class DiscoveryService:
                 print(f"[ezpeek] Discovery broadcast sent: {message}")
             except Exception:
                 pass
-            # Faster when hosting so peers pick up ports quickly
             time.sleep(1.5)
 
     def _emit_peer(
@@ -175,9 +191,25 @@ class DiscoveryService:
                     except ValueError:
                         refresh_hz = None
 
-                # Skip self (compare both advertised IP and packet source)
+                # Skip self
                 if ip == self._my_ip or addr[0] == self._my_ip:
                     continue
+
+                # Remember both advertised IP and packet source for unicast
+                with self._lock:
+                    self._known_peers.add(ip)
+                    if addr[0] and addr[0] != self._my_ip:
+                        self._known_peers.add(addr[0])
+
+                # Unicast our hello back so the peer learns about us even if
+                # our broadcasts never reach them (or vice versa).
+                try:
+                    reply = self._build_message()
+                    self.sock.sendto(reply.encode(), (addr[0], BROADCAST_PORT))
+                    if ip != addr[0]:
+                        self.sock.sendto(reply.encode(), (ip, BROADCAST_PORT))
+                except Exception:
+                    pass
 
                 key = (port, ctrl_port, refresh_hz)
                 prev = self._last.get(ip)
@@ -188,7 +220,7 @@ class DiscoveryService:
                 self._emit_peer(name, ip, port, ctrl_port, refresh_hz)
                 print(
                     f"[ezpeek] Discovered peer: {name} @ {ip} "
-                    f"video={port} ctrl={ctrl_port} hz={refresh_hz}"
+                    f"video={port} ctrl={ctrl_port} hz={refresh_hz} (src={addr[0]})"
                 )
 
             except socket.timeout:

@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QSizePolicy,
 )
-from PySide6.QtCore import Qt, Signal, QObject, QThread, Slot
+from PySide6.QtCore import Qt, Signal, QObject, QThread, Slot, QTimer
 from PySide6.QtGui import (
     QImage,
     QPixmap,
@@ -49,6 +49,7 @@ class _MjpegReader(QObject):
         self._cmd = cmd
         self._proc: Optional[subprocess.Popen] = None
         self._stop = threading.Event()
+        self._got_frame = False
 
     @Slot()
     def run(self):
@@ -66,7 +67,6 @@ class _MjpegReader(QObject):
         self.started_ok.emit()
         assert self._proc.stdout is not None
         buf = bytearray()
-        # Drain stderr in a side thread so the pipe cannot fill up
         err_chunks: list[bytes] = []
 
         def _drain_err():
@@ -87,23 +87,34 @@ class _MjpegReader(QObject):
 
         SOI = b"\xff\xd8"
         EOI = b"\xff\xd9"
+        import time as _time
 
+        start_t = _time.time()
         try:
             while not self._stop.is_set():
+                # Stall watchdog: no frame in 12s → fail with ffmpeg stderr
+                if not self._got_frame and (_time.time() - start_t) > 12:
+                    err = b"".join(err_chunks).decode(errors="ignore").strip()
+                    self.failed.emit(
+                        err[-500:]
+                        if err
+                        else "No video frames in 12s (firewall UDP 2734? host still hosting?)"
+                    )
+                    break
+
                 chunk = self._proc.stdout.read(4096)
                 if not chunk:
                     break
                 buf.extend(chunk)
 
                 while True:
-                    start = buf.find(SOI)
-                    if start < 0:
-                        # keep tail in case SOI is split
+                    s0 = buf.find(SOI)
+                    if s0 < 0:
                         if len(buf) > 2:
                             del buf[:-2]
                         break
-                    if start > 0:
-                        del buf[:start]
+                    if s0 > 0:
+                        del buf[:s0]
                     end = buf.find(EOI, 2)
                     if end < 0:
                         break
@@ -112,9 +123,9 @@ class _MjpegReader(QObject):
                     del buf[:end]
                     img = QImage.fromData(jpeg, "JPEG")
                     if not img.isNull():
+                        self._got_frame = True
                         self.frame.emit(img)
 
-                # prevent unbounded growth if stream is garbage
                 if len(buf) > 8_000_000:
                     buf.clear()
         except Exception as e:
@@ -132,8 +143,11 @@ class _MjpegReader(QObject):
                     except Exception:
                         pass
             err = b"".join(err_chunks).decode(errors="ignore").strip()
-            if self._proc and self._proc.returncode not in (0, None, -15, 255):
-                # -15 = SIGTERM on some platforms
+            if (
+                not self._got_frame
+                and self._proc
+                and self._proc.returncode not in (0, None, -15, 255)
+            ):
                 msg = err[-800:] if err else f"decoder exit {self._proc.returncode}"
                 self.failed.emit(msg)
 
@@ -320,8 +334,14 @@ class ViewerWindow(QMainWindow):
         print(f"[ezpeek viewer] Local display refresh ≈ {self.local_hz:.2f} Hz")
 
         self._build_ui()
+        # Control first (sends CLIENT_CAPS → host may restart encoder at min FPS).
+        # Delay video so we don't connect mid-restart and hang on "Connecting…".
         self._connect_control()
-        self._start_video()
+        self.status_label.setText(
+            (self.status_label.text() or "Control…")
+            + " · waiting for host stream…"
+        )
+        QTimer.singleShot(1800, self._start_video)
 
     def _build_ui(self):
         central = QWidget()
@@ -376,7 +396,10 @@ class ViewerWindow(QMainWindow):
 
     def _start_video(self):
         try:
-            cmd = build_integrated_decode_cmd(self.host_ip, int(self.video_port))
+            # Software decode by default — more reliable across Windows/Linux codecs.
+            cmd = build_integrated_decode_cmd(
+                self.host_ip, int(self.video_port), use_hwaccel=False
+            )
         except Exception as e:
             self.status_label.setText(f"Decoder setup failed: {e}")
             return
@@ -389,9 +412,7 @@ class ViewerWindow(QMainWindow):
         self._reader.failed.connect(self._on_decode_fail)
         self._reader.started_ok.connect(
             lambda: self.status_label.setText(
-                self.status_label.text() + " · decoding…"
-                if "Control" in self.status_label.text()
-                else "Decoding stream…"
+                f"Connecting to srt://{self.host_ip}:{self.video_port} …"
             )
         )
         self._thread.start()

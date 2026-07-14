@@ -167,8 +167,14 @@ class HostService:
             f"[ezpeek host] Peer display {peer_hz:.2f} Hz · host {self.host_hz:.2f} Hz "
             f"→ stream {new_fps} fps (was {old_fps})"
         )
+        # Only restart if FPS actually changes. Restarting mid-view can leave
+        # clients stuck on "Connecting…" until they reconnect.
         if abs(new_fps - old_fps) >= 1 and self.state.proc and self.state.proc.poll() is None:
             self.fps = new_fps
+            print(
+                f"[ezpeek host] Will restart sender for FPS change {old_fps}→{new_fps} "
+                f"(viewers may briefly reconnect)"
+            )
             threading.Thread(target=self._restart_sender, daemon=True, name="ezpeek-fps-restart").start()
         else:
             self.fps = new_fps
