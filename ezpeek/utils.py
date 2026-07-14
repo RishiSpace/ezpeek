@@ -10,9 +10,9 @@ from typing import Optional
 
 
 # Stream quality bounds (kbps). Encoders use VBR/CBR-with-cap inside this range.
-BITRATE_MIN_KBPS = 3000
+BITRATE_MIN_KBPS = 20000
 BITRATE_MAX_KBPS = 30000
-BITRATE_TARGET_KBPS = 12000  # preferred average when VBR is available
+BITRATE_TARGET_KBPS = 25000  # preferred average; clamped into [min, max]
 
 # Practical stream FPS clamps (some panels report odd floats)
 FPS_MIN = 24

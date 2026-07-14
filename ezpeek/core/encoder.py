@@ -15,8 +15,8 @@ class EncodeSpec:
     # "auto" = prefer working HW AV1, else working HW/soft H.264
     codec: VideoCodec = "auto"
     # VBR target / range (kbps). Encoders clamp inside [bitrate_min, bitrate_max].
-    bitrate_kbps: int = 12000
-    bitrate_min_kbps: int = 3000
+    bitrate_kbps: int = 25000
+    bitrate_min_kbps: int = 20000
     bitrate_max_kbps: int = 30000
     fps: int = 60
     gop: int = 60
@@ -201,7 +201,7 @@ def mux_format_for_family(family: str) -> str:
 def build_video_encode_args(spec: EncodeSpec) -> list[str]:
     """Build ffmpeg output-side encode args for low-latency streaming (VBR where possible)."""
     target = max(spec.bitrate_min_kbps, min(spec.bitrate_max_kbps, spec.bitrate_kbps))
-    bmin = max(500, min(spec.bitrate_min_kbps, target))
+    bmin = max(1000, min(spec.bitrate_min_kbps, target))
     bmax = max(target, spec.bitrate_max_kbps)
     bitrate = f"{target}k"
     maxrate = f"{bmax}k"
