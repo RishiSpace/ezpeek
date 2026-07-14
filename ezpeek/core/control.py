@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import socket
 import threading
-import time
 from typing import Callable, Optional
 
 from .input_controller import InputController
@@ -26,9 +25,15 @@ from .input_controller import InputController
 class ControlServer:
     """
     Runs on the HOST side. Listens for control connections and applies input locally.
+    Always prefer binding host="0.0.0.0" so LAN peers can connect.
     """
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 0, on_event: Optional[Callable[[str], None]] = None):
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 0,
+        on_event: Optional[Callable[[str], None]] = None,
+    ):
         self.host = host
         self.port = port or 0
         self.on_event = on_event
@@ -44,12 +49,14 @@ class ControlServer:
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # On Windows, dual-stack quirks are fine; keep IPv4 simple for Phase 1.
         self._sock.bind((self.host, self.port))
         self._sock.listen(4)
         self.port = self._sock.getsockname()[1]
         self._running = True
-        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True, name="ezpeek-ctrl-accept")
         self._thread.start()
+        print(f"[ezpeek-control] Server listening on {self.host}:{self.port}")
         return self.port
 
     def stop(self):
@@ -72,15 +79,24 @@ class ControlServer:
             try:
                 self._sock.settimeout(1.0)
                 client, addr = self._sock.accept()
-                client.settimeout(300)  # 5 minutes idle timeout for control connection
+                client.settimeout(300.0)
                 self._clients.append(client)
-                t = threading.Thread(target=self._handle_client, args=(client, addr), daemon=True)
+                print(f"[ezpeek-control] Client connected from {addr}")
+                t = threading.Thread(
+                    target=self._handle_client,
+                    args=(client, addr),
+                    daemon=True,
+                    name=f"ezpeek-ctrl-{addr[0]}",
+                )
                 t.start()
             except socket.timeout:
                 continue
-            except Exception:
+            except TimeoutError:
+                continue
+            except Exception as e:
                 if not self._running:
                     break
+                print(f"[ezpeek-control] accept error: {e}")
 
     def _handle_client(self, client: socket.socket, addr):
         buf = b""
@@ -101,11 +117,13 @@ class ControlServer:
                                     self.on_event(msg)
                                 except Exception:
                                     pass
-                except TimeoutError:
-                    continue  # no data yet, keep waiting for input
-                except Exception:
+                except (socket.timeout, TimeoutError):
+                    continue
+                except Exception as e:
+                    print(f"[ezpeek-control] client {addr} error: {e}")
                     break
         finally:
+            print(f"[ezpeek-control] Client disconnected {addr}")
             try:
                 client.close()
             except Exception:
@@ -135,13 +153,14 @@ class ControlServer:
                 down = parts[2].lower() != "up" if len(parts) > 2 else True
                 self.input.send_key(key, down=down)
             elif cmd == "PING":
-                # could reply but fire-and-forget is fine for now
-                pass
+                try:
+                    client_reply = None  # fire-and-forget for Phase 1
+                    _ = client_reply
+                except Exception:
+                    pass
             elif cmd == "QUIT":
-                # close handled by client loop
                 pass
         except Exception as e:
-            # Never crash the control thread
             print(f"[ezpeek-control] dispatch error: {e}")
 
 
@@ -153,18 +172,45 @@ class ControlClient:
     def __init__(self):
         self._sock: Optional[socket.socket] = None
         self._connected = False
+        self._host: str = ""
+        self._port: int = 0
 
-    def connect(self, host: str, port: int, timeout: float = 3.0) -> bool:
-        try:
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._sock.settimeout(timeout)
-            self._sock.connect((host, port))
-            self._connected = True
-            return True
-        except Exception:
-            self._connected = False
-            self._sock = None
-            return False
+    @property
+    def connected(self) -> bool:
+        return self._connected and self._sock is not None
+
+    def connect(self, host: str, port: int, timeout: float = 5.0, retries: int = 3) -> bool:
+        """Connect with short retries (host control may come up slightly after video)."""
+        self.close()
+        self._host = host
+        self._port = port
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                sock.connect((host, port))
+                # Keepalive-ish: longer idle timeout for remoting sessions
+                sock.settimeout(None)
+                self._sock = sock
+                self._connected = True
+                print(f"[ezpeek-control] Connected to {host}:{port} (attempt {attempt})")
+                return True
+            except Exception as e:
+                last_err = e
+                print(f"[ezpeek-control] Connect attempt {attempt}/{retries} to {host}:{port} failed: {e}")
+                try:
+                    sock.close()  # type: ignore[name-defined]
+                except Exception:
+                    pass
+                self._sock = None
+                self._connected = False
+                if attempt < retries:
+                    import time
+
+                    time.sleep(0.4 * attempt)
+        print(f"[ezpeek-control] All connect attempts failed: {last_err}")
+        return False
 
     def send(self, msg: str) -> bool:
         if not self._connected or not self._sock:
@@ -173,7 +219,8 @@ class ControlClient:
             data = (msg.strip() + "\n").encode("utf-8")
             self._sock.sendall(data)
             return True
-        except Exception:
+        except Exception as e:
+            print(f"[ezpeek-control] send failed: {e}")
             self._connected = False
             return False
 
@@ -194,7 +241,10 @@ class ControlClient:
     def close(self):
         if self._sock:
             try:
-                self.send("QUIT")
+                try:
+                    self.send("QUIT")
+                except Exception:
+                    pass
                 self._sock.close()
             except Exception:
                 pass
@@ -202,7 +252,6 @@ class ControlClient:
         self._connected = False
 
 
-# Simple test helper
 def test_control_roundtrip():
     """For manual verification."""
     srv = ControlServer(port=0)

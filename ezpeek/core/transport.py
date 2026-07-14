@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import subprocess
 import tarfile
 import urllib.request
 import zipfile
@@ -16,24 +17,46 @@ from .encoder import EncodeSpec, build_video_encode_args
 
 Transport = Literal["srt"]
 
+# LAN-friendly defaults. 20ms was too aggressive and caused flaky connects.
+DEFAULT_SRT_LATENCY_MS = 120
+
 
 @dataclass(frozen=True)
 class TransportSpec:
     transport: Transport = "srt"
+    # For the sender/listener this is the *bind* address (use 0.0.0.0).
+    # For the receiver/caller this is the peer address to dial.
     host: str = "0.0.0.0"
     port: int = 2734
+    latency_ms: int = DEFAULT_SRT_LATENCY_MS
 
 
-def srt_url(host: str, port: int, mode: Literal["caller", "listener"], *, latency_ms: int = 20, extra: Optional[str] = None) -> str:
+def srt_url(
+    host: str,
+    port: int,
+    mode: Literal["caller", "listener"],
+    *,
+    latency_ms: int = DEFAULT_SRT_LATENCY_MS,
+    extra: Optional[str] = None,
+) -> str:
     """
-    Build SRT URL with low-latency tuning suitable for remoting.
-    latency_ms: end-to-end target latency.
-    extra: additional query params e.g. "rcvlatency=10&snddropdelay=0"
+    Build SRT URL with live streaming tuning suitable for remoting.
     """
-    base = f"srt://{host}:{port}?mode={mode}&latency={latency_ms}"
+    params = [
+        f"mode={mode}",
+        f"latency={latency_ms}",
+        "transtype=live",
+    ]
     if extra:
-        base += "&" + extra.lstrip("&")
-    return base
+        # Allow callers to pass additional params without duplicating mode/latency.
+        for part in extra.lstrip("&").split("&"):
+            if not part:
+                continue
+            key = part.split("=", 1)[0].lower()
+            if key in ("mode", "latency", "transtype"):
+                continue
+            params.append(part)
+    return f"srt://{host}:{port}?{'&'.join(params)}"
 
 
 _FFMPEG_CACHE: Optional[str] = None
@@ -47,6 +70,12 @@ def _get_ffmpeg_dir() -> Path:
     else:
         base = Path.home() / ".local" / "share"
     return base / "ezpeek" / "ffmpeg"
+
+
+def clear_ffmpeg_cache() -> None:
+    global _FFMPEG_CACHE, _FFPLAY_CACHE
+    _FFMPEG_CACHE = None
+    _FFPLAY_CACHE = None
 
 
 def _find_ffmpeg_executables() -> tuple[str, str]:
@@ -67,7 +96,7 @@ def _find_ffmpeg_executables() -> tuple[str, str]:
 
     # 2. Check our local portable installation
     ffmpeg_dir = _get_ffmpeg_dir()
-    print(f"[ezpeek ffmpeg] No PATH ffplay, checking portable dir: {ffmpeg_dir}")
+    print(f"[ezpeek ffmpeg] No PATH pair, checking portable dir: {ffmpeg_dir}")
     if platform.system().lower() == "windows":
         candidates = list(ffmpeg_dir.rglob("ffmpeg.exe"))
         ffplay_candidates = list(ffmpeg_dir.rglob("ffplay.exe"))
@@ -86,7 +115,6 @@ def _find_ffmpeg_executables() -> tuple[str, str]:
     ffmpeg_dir.mkdir(parents=True, exist_ok=True)
 
     sys_name = platform.system().lower()
-    machine = platform.machine().lower()
 
     if sys_name == "windows":
         url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
@@ -95,8 +123,7 @@ def _find_ffmpeg_executables() -> tuple[str, str]:
         urllib.request.urlretrieve(url, archive)
         with zipfile.ZipFile(archive) as zf:
             zf.extractall(ffmpeg_dir)
-        archive.unlink()
-        # Find inside the extracted folder
+        archive.unlink(missing_ok=True)
         candidates = list(ffmpeg_dir.rglob("ffmpeg.exe"))
         ffplay_candidates = list(ffmpeg_dir.rglob("ffplay.exe"))
     else:
@@ -107,7 +134,7 @@ def _find_ffmpeg_executables() -> tuple[str, str]:
         urllib.request.urlretrieve(url, archive)
         with tarfile.open(archive, "r:xz") as tf:
             tf.extractall(ffmpeg_dir)
-        archive.unlink()
+        archive.unlink(missing_ok=True)
         candidates = list(ffmpeg_dir.rglob("ffmpeg"))
         ffplay_candidates = list(ffmpeg_dir.rglob("ffplay"))
 
@@ -126,14 +153,15 @@ def _find_ffmpeg_executables() -> tuple[str, str]:
     return _FFMPEG_CACHE, _FFPLAY_CACHE
 
 
-def ensure_ffmpeg_tools() -> None:
+def ensure_ffmpeg_tools() -> tuple[str, str]:
+    """Ensure ffmpeg + ffplay are available (PATH or portable). Returns their paths."""
     print("[ezpeek ffmpeg] ensure_ffmpeg_tools() called")
     try:
         ffmpeg, ffplay = _find_ffmpeg_executables()
         print(f"[ezpeek ffmpeg] ensure_ffmpeg_tools success -> ffmpeg={ffmpeg}, ffplay={ffplay}")
+        return ffmpeg, ffplay
     except Exception as e:
         print(f"[ezpeek ffmpeg] ensure_ffmpeg_tools EXCEPTION: {repr(e)}")
-        # Fallback to helpful error if auto-download also fails
         system = platform.system().lower()
         if system == "windows":
             msg = (
@@ -154,92 +182,133 @@ def ensure_ffmpeg_tools() -> None:
             msg = "FFmpeg not found. Please install the full FFmpeg package (includes ffplay)."
         raise RuntimeError(msg) from e
 
-    if shutil.which("ffmpeg") is None or shutil.which("ffplay") is None:
-        system = platform.system().lower()
-        if system == "windows":
-            msg = (
-                "ffmpeg / ffplay not found on PATH.\n\n"
-                "On Windows:\n"
-                "Recommended:\n"
-                "1. winget install Gyan.FFmpeg   (or 'winget install ffmpeg')\n"
-                "2. Close and reopen your terminal / PowerShell / the app\n\n"
-                "Manual (guaranteed full build with ffplay):\n"
-                "1. Go to https://www.gyan.dev/ffmpeg/builds/\n"
-                "2. Download the latest 'full' or 'essentials' zip\n"
-                "3. Extract it (example: C:\\ffmpeg)\n"
-                "4. Add C:\\ffmpeg\\bin to your System PATH (search 'Edit the system environment variables')\n"
-                "5. Restart your terminal and the ezpeek app\n\n"
-                "Verify: open a new cmd and type `ffmpeg -version` and `ffplay -version`"
-            )
-        elif system == "linux":
-            msg = (
-                "ffmpeg / ffplay not found on PATH.\n\n"
-                "Install it with your package manager, e.g.:\n"
-                "  Ubuntu/Debian: sudo apt install ffmpeg\n"
-                "  Arch: sudo pacman -S ffmpeg\n"
-                "  Fedora: sudo dnf install ffmpeg"
-            )
-        else:
-            msg = "ffmpeg / ffplay not found on PATH. Please install the full FFmpeg package."
 
-        raise RuntimeError(msg)
+def has_srt_support() -> bool:
+    """Check whether the selected ffmpeg build supports the srt protocol."""
+    try:
+        ffmpeg, _ = _find_ffmpeg_executables()
+        p = subprocess.run(
+            [ffmpeg, "-hide_banner", "-protocols"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        txt = ((p.stdout or "") + (p.stderr or "")).lower()
+        return "srt" in txt
+    except Exception:
+        return False
 
 
-def build_sender_cmd(capture: CaptureSpec, encode: EncodeSpec, tx: TransportSpec) -> list[str]:
+def build_sender_cmd(
+    capture: CaptureSpec,
+    encode: EncodeSpec,
+    tx: TransportSpec,
+    *,
+    test_pattern: bool = False,
+    pipewire_node_id: Optional[int] = None,
+    gst_log_path: Optional[str] = None,
+) -> list[str]:
     ensure_ffmpeg_tools()
     ffmpeg_exe, _ = _find_ffmpeg_executables()
 
     if tx.transport != "srt":
         raise RuntimeError(f"Unsupported transport: {tx.transport}")
 
-    # Pure Wayland support (no X11). Use external capture tools + pipe to ffmpeg when
-    # FFmpeg lacks native -f pipewire. Keeps support for Ubuntu 26.04+ etc. Wayland-only.
+    if not has_srt_support():
+        raise RuntimeError(
+            "This FFmpeg build has no SRT support. Install a full build with libsrt "
+            "(e.g. package manager ffmpeg, or Gyan full builds on Windows)."
+        )
+
+    # Bind on all interfaces so LAN peers can connect regardless of which IP we advertise.
+    bind_host = tx.host if tx.host not in ("", None) else "0.0.0.0"
+    out_url = srt_url(
+        bind_host,
+        tx.port,
+        mode="listener",
+        latency_ms=tx.latency_ms,
+        extra="snddropdelay=0",
+    )
+
+    # Synthetic pattern for self-test / debugging without screen capture permissions.
+    if test_pattern:
+        fr = str(encode.fps)
+        cmd = [
+            ffmpeg_exe,
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-re",
+            "-f", "lavfi",
+            "-i", f"testsrc=size=1280x720:rate={fr}",
+        ]
+        cmd += build_video_encode_args(encode)
+        cmd += ["-f", "mpegts", out_url]
+        return cmd
+
+    # Pure Wayland support when FFmpeg lacks native -f pipewire.
+    # Prefer: wl-screenrec → GStreamer pipewiresrc (quiet y4m pipe) → fall through.
     if platform.system().lower() == "linux":
         try:
-            from .capture import (_is_wayland, _has_wl_screenrec,
-                                  _check_ffmpeg_pipewire_support, _has_gstreamer_pipewire)
+            from .capture import (
+                _is_wayland,
+                _has_wl_screenrec,
+                _check_ffmpeg_pipewire_support,
+                _has_gstreamer_pipewire,
+            )
+
             if _is_wayland() and not _check_ffmpeg_pipewire_support():
                 fr = str(capture.fps)
                 encode_part = " ".join(build_video_encode_args(encode))
-                srt_url_str = srt_url(tx.host, tx.port, mode="listener", latency_ms=20, extra="snddropdelay=0")
                 if _has_wl_screenrec():
                     wl_part = f"wl-screenrec --fps {fr} -c h264 --ffmpeg-muxer mpegts -o -"
-                    pipeline = f"{wl_part} | {ffmpeg_exe} -hide_banner -loglevel warning -fflags nobuffer -flags low_delay -i - {encode_part} -f mpegts '{srt_url_str}'"
-                    return ["sh", "-c", pipeline]
-                elif _has_gstreamer_pipewire():
-                    # Trigger portal grant and get node for specific capture.
-                    node_id = None
-                    try:
-                        from .capture import request_pipewire_node_id
-                        node_id = request_pipewire_node_id(app_id="ezpeek")
-                    except Exception:
-                        pass
-                    if node_id:
-                        src = f"pipewiresrc path={node_id} do-timestamp=true"
-                    else:
-                        src = "pipewiresrc do-timestamp=true"
-                    # More robust pipeline for pipewiresrc negotiation:
-                    # - videorate before forcing framerate caps
-                    # - extra queue + explicit negotiation order
-                    # - avoid strict framerate on the raw caps before rate conversion
-                    gst = (
-                        f"gst-launch-1.0 "
-                        f"{src} ! queue max-size-buffers=4 leaky=downstream ! "
-                        f"videoconvert ! "
-                        f"videorate ! video/x-raw,format=I420,framerate={fr}/1 ! "
-                        f"y4menc ! queue ! fdsink fd=1"
+                    pipeline = (
+                        f"{wl_part} | {ffmpeg_exe} -hide_banner -loglevel warning "
+                        f"-fflags nobuffer -flags low_delay -i - {encode_part} "
+                        f"-f mpegts '{out_url}'"
                     )
-                    pipeline = f"{gst} | {ffmpeg_exe} -hide_banner -loglevel warning -fflags nobuffer -flags low_delay -f yuv4mpegpipe -i - {encode_part} -f mpegts '{srt_url_str}'"
                     return ["sh", "-c", pipeline]
-        except Exception:
-            pass  # fall through to build_capture (which may use kmsgrab or raise)
+                elif _has_gstreamer_pipewire() and pipewire_node_id is not None:
+                    # IMPORTANT:
+                    # 1) gst-launch must be quiet (-q). Its status lines on stdout
+                    #    corrupt the Y4M stream → "Invalid magic number for yuv4mpeg".
+                    # 2) pipewire_node_id must come from a still-open ScreenCastSession
+                    #    held by HostService (do not request portal here and drop it).
+                    log = gst_log_path or "/tmp/ezpeek_gst.log"
+                    src = f"pipewiresrc path={int(pipewire_node_id)} do-timestamp=true"
+                    # Simpler caps: let videorate handle fps; avoid over-constraining.
+                    gst = (
+                        f"gst-launch-1.0 -q "
+                        f"{src} ! "
+                        f"queue max-size-buffers=8 leaky=downstream ! "
+                        f"videoconvert ! video/x-raw,format=I420 ! "
+                        f"videorate ! video/x-raw,framerate={fr}/1 ! "
+                        f"y4menc ! fdsink fd=1"
+                    )
+                    # stderr from gst goes to log; stdout is pure Y4M for ffmpeg.
+                    pipeline = (
+                        f"{gst} 2>'{log}' | "
+                        f"{ffmpeg_exe} -hide_banner -loglevel warning "
+                        f"-fflags nobuffer -flags low_delay "
+                        f"-f yuv4mpegpipe -i - "
+                        f"{encode_part} -f mpegts '{out_url}'"
+                    )
+                    print(f"[ezpeek] Wayland capture via GStreamer pipewire node={pipewire_node_id}")
+                    print(f"[ezpeek] GStreamer log: {log}")
+                    return ["sh", "-c", pipeline]
+                elif _has_gstreamer_pipewire() and pipewire_node_id is None:
+                    print(
+                        "[ezpeek] GStreamer available but no PipeWire node id "
+                        "(ScreenCast session not started). Falling through..."
+                    )
+        except Exception as e:
+            print(f"[ezpeek] Wayland external capture path failed: {e}")
 
     input_args = build_capture_input_args(capture)
 
     cmd = [
         ffmpeg_exe,
         "-hide_banner",
-        "-loglevel", "warning",   # less noisy for production feel
+        "-loglevel", "warning",
         "-fflags", "nobuffer",
         "-flags", "low_delay",
         "-probesize", "32",
@@ -248,8 +317,7 @@ def build_sender_cmd(capture: CaptureSpec, encode: EncodeSpec, tx: TransportSpec
     ]
     cmd += input_args
     cmd += build_video_encode_args(encode)
-    # Strong low latency SRT tuning
-    cmd += ["-f", "mpegts", srt_url(tx.host, tx.port, mode="listener", latency_ms=20, extra="snddropdelay=0")]
+    cmd += ["-f", "mpegts", out_url]
     return cmd
 
 
@@ -257,8 +325,12 @@ def _get_supported_hwaccels() -> str:
     """Query ffplay for list of supported hardware accelerators."""
     try:
         _, ffplay = _find_ffmpeg_executables()
-        p = subprocess.run([ffplay, "-hide_banner", "-hwaccels"],
-                           capture_output=True, text=True, check=False)
+        p = subprocess.run(
+            [ffplay, "-hide_banner", "-hwaccels"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         return (p.stdout or "") + (p.stderr or "")
     except Exception:
         return ""
@@ -272,36 +344,41 @@ def _get_hwaccel_arg() -> list[str]:
     sys_name = platform.system().lower()
 
     if sys_name == "windows":
-        # Prefer d3d11va, then cuda, else software
         if "d3d11va" in txt:
-            return ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
+            return ["-hwaccel", "d3d11va"]
         if "cuda" in txt:
             return ["-hwaccel", "cuda"]
-        return []  # software decode
+        return []
 
-    elif sys_name == "linux":
-        # vaapi first for intel/amd, cuda for nvidia, else software
+    if sys_name == "linux":
         if "vaapi" in txt:
-            return ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
+            return ["-hwaccel", "vaapi"]
         if "cuda" in txt:
             return ["-hwaccel", "cuda"]
         if "vdpau" in txt:
             return ["-hwaccel", "vdpau"]
-        return []  # software decode
+        return []
 
-    # other platforms: try auto, which will fallback to software
-    if "auto" in txt or "none" in txt:
+    if "auto" in txt:
         return ["-hwaccel", "auto"]
-    return []  # software
+    return []
 
 
-def build_receiver_cmd(host: str, port: int, transport: Transport = "srt") -> list[str]:
+def build_receiver_cmd(
+    host: str,
+    port: int,
+    transport: Transport = "srt",
+    *,
+    latency_ms: int = DEFAULT_SRT_LATENCY_MS,
+) -> list[str]:
     print(f"[ezpeek viewer] build_receiver_cmd called for {host}:{port}")
     ensure_ffmpeg_tools()
     _, ffplay_exe = _find_ffmpeg_executables()
     print(f"[ezpeek viewer] Using ffplay executable: {ffplay_exe}")
     if transport != "srt":
         raise RuntimeError(f"Unsupported transport: {transport}")
+    if not has_srt_support():
+        raise RuntimeError("This FFmpeg build has no SRT support (needed for video).")
 
     hw = _get_hwaccel_arg()
     cmd = [
@@ -311,12 +388,11 @@ def build_receiver_cmd(host: str, port: int, transport: Transport = "srt") -> li
         "-fflags", "nobuffer",
         "-flags", "low_delay",
         "-framedrop",
-        "-sync", "video",
-        "-infbuf",
-        "-fast",
+        "-sync", "ext",
+        "-window_title", f"EzPeek Video - {host}:{port}",
     ]
     cmd += hw
-    srt = srt_url(host, port, mode="caller", latency_ms=20, extra="rcvlatency=10")
+    srt = srt_url(host, port, mode="caller", latency_ms=latency_ms, extra="rcvlatency=0")
     cmd += [srt]
     print(f"[ezpeek viewer] Full ffplay command: {cmd}")
     print(f"[ezpeek viewer] SRT URL: {srt}")

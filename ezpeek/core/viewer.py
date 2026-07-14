@@ -1,89 +1,108 @@
 from __future__ import annotations
 
 import os
+import platform
 import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
+from ezpeek.utils import get_log_dir
 from .transport import build_receiver_cmd
 
 
 @dataclass
 class ViewerState:
     proc: subprocess.Popen | None = None
+    log_path: str = ""
+    last_error: str = ""
 
 
 class ViewerService:
+    """Launches external ffplay to receive an SRT stream from a LAN host."""
+
     def __init__(self):
         self.state = ViewerState()
+        self._log_file = None
 
     def start(self, host_ip: str, port: int) -> None:
         print(f"[ezpeek viewer] ViewerService.start(host={host_ip}, port={port})")
         if self.state.proc and self.state.proc.poll() is None:
-            print("[ezpeek viewer] Viewer already running, skipping start")
-            return
+            print("[ezpeek viewer] Viewer already running, stopping previous instance first")
+            self.stop()
+
+        self.state.last_error = ""
         cmd = build_receiver_cmd(host_ip, port)
 
-        # Add a nice window title so user can identify it
-        cmd = cmd[:1] + ["-window_title", f"EzPeek Video - {host_ip}:{port}"] + cmd[1:]
-
-        print(f"[ezpeek viewer] Launching external viewer process...")
-        # Use env explicitly. We want the GUI ffplay window to appear in the user's desktop session.
         env = os.environ.copy()
+        # Ensure GUI backends can find a display when launched from a desktop session.
+        if platform.system().lower() == "linux":
+            if not env.get("DISPLAY") and not env.get("WAYLAND_DISPLAY"):
+                print("[ezpeek viewer] WARNING: No DISPLAY/WAYLAND_DISPLAY — ffplay window may not appear")
 
-        # Redirect ffplay's output (status, errors, connection info) to a dedicated log file.
-        # This prevents any pipe buffering issues and gives full debug output for ffplay/SDL/SRT.
-        log_path = f"/tmp/ezpeek_ffplay_{host_ip.replace('.', '_')}_{port}.log"
+        log_path = get_log_dir() / f"ffplay_{host_ip.replace('.', '_').replace(':', '_')}_{port}.log"
+        self.state.log_path = str(log_path)
         try:
-            log_file = open(log_path, "w", buffering=1)
-            print(f"[ezpeek viewer] ffplay stderr/stdout redirected to: {log_path}")
-            print("[ezpeek viewer] If no video window appears, tail -f that file for errors.")
+            if self._log_file:
+                try:
+                    self._log_file.close()
+                except Exception:
+                    pass
+            self._log_file = open(log_path, "w", buffering=1)
+            print(f"[ezpeek viewer] ffplay log: {log_path}")
         except Exception as e:
             print(f"[ezpeek viewer] Could not open log file {log_path}: {e}")
-            log_file = None
+            self._log_file = None
 
-        popen_kwargs = {
-            "stdout": log_file if log_file else subprocess.DEVNULL,
+        popen_kwargs: dict = {
+            "stdout": self._log_file if self._log_file else subprocess.DEVNULL,
             "stderr": subprocess.STDOUT,
             "env": env,
-            "text": True,
         }
 
-        self.state.proc = subprocess.Popen(cmd, **popen_kwargs)
-        print(f"[ezpeek viewer] Popen returned, pid={self.state.proc.pid if self.state.proc else None}")
-        print(f"[ezpeek viewer] Command was: {cmd}")
+        # Windows: do NOT use CREATE_NO_WINDOW — ffplay needs a visible SDL window.
+        # start_new_session helps avoid signals/parent tty quirks on Unix.
+        if platform.system().lower() != "windows":
+            popen_kwargs["start_new_session"] = True
 
-        # Give ffplay a moment to start or fail (GUI apps + window manager can take time)
-        time.sleep(1.5)
+        print(f"[ezpeek viewer] Launching: {cmd}")
+        self.state.proc = subprocess.Popen(cmd, **popen_kwargs)
+        print(f"[ezpeek viewer] Popen pid={self.state.proc.pid}")
+
+        # Give ffplay time to connect or fail fast.
+        time.sleep(1.2)
 
         if self.state.proc.poll() is not None:
             code = self.state.proc.returncode
+            out = ""
+            try:
+                out = Path(log_path).read_text(errors="ignore")
+            except Exception:
+                pass
+            self.state.last_error = (out or f"ffplay exited with code {code}").strip()[-2000:]
             print(f"[ezpeek viewer] !!! ffplay exited immediately with code {code}")
-            if log_file:
-                try:
-                    log_file.flush()
-                    with open(log_path, "r") as f:
-                        out = f.read()
-                    print(f"[ezpeek viewer] ffplay log content:\n{out[:3000]}")
-                except Exception:
-                    pass
-                try:
-                    log_file.close()
-                except Exception:
-                    pass
-            else:
-                print("[ezpeek viewer] (check terminal or system logs)")
-        else:
-            print(f"[ezpeek viewer] ffplay appears to be running (no early exit). Look for window titled 'EzPeek Video - {host_ip}:{port}'")
-            # Keep log file open while proc lives (store handle on state for later close)
-            if not hasattr(self.state, "log_file"):
-                self.state.log_file = None
-            self.state.log_file = log_file  # type: ignore[attr-defined]
+            print(f"[ezpeek viewer] log:\n{self.state.last_error[:2000]}")
+            self.state.proc = None
+            raise RuntimeError(
+                f"ffplay failed to start (exit {code}). See log: {log_path}\n{self.state.last_error[:400]}"
+            )
+
+        print(
+            f"[ezpeek viewer] ffplay running. Look for window 'EzPeek Video - {host_ip}:{port}'. "
+            f"Log: {log_path}"
+        )
 
     def stop(self) -> None:
         p = self.state.proc
         if not p:
+            if self._log_file:
+                try:
+                    self._log_file.close()
+                except Exception:
+                    pass
+                self._log_file = None
             return
+
         print("[ezpeek viewer] Stopping viewer process")
         if p.poll() is None:
             try:
@@ -97,11 +116,11 @@ class ViewerService:
                     pass
             except Exception:
                 pass
-        # Close the debug log file if we opened one
-        if hasattr(self.state, "log_file") and getattr(self.state, "log_file", None):
+
+        if self._log_file:
             try:
-                self.state.log_file.close()
+                self._log_file.close()
             except Exception:
                 pass
-            self.state.log_file = None
+            self._log_file = None
         self.state.proc = None

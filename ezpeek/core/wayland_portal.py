@@ -73,57 +73,113 @@ def _call_and_wait(bus, request_path, timeout_ms: int = 30_000) -> dict:
     return {"response": out["response"], "results": out.get("results", {})}
 
 
+class ScreenCastSession:
+    """
+    xdg-desktop-portal ScreenCast session that stays alive for the whole host session.
+
+    Critical: the PipeWire node is only valid while this object (and its D-Bus session)
+    remains referenced. Returning only a node id and dropping the session causes empty /
+    invalid frames and ffmpeg yuv4mpeg "Invalid magic number" errors.
+    """
+
+    def __init__(self):
+        self.bus = None
+        self.session_handle = None
+        self.node_id: Optional[int] = None
+        self._portal = None
+        self._sc = None
+        self._session_obj = None
+        self._active = False
+
+    @property
+    def active(self) -> bool:
+        return self._active and self.node_id is not None
+
+    def start(self, app_id: str = "ezpeek", timeout_ms: int = 60_000) -> int:
+        if self._active and self.node_id is not None:
+            return self.node_id
+
+        if not _is_wayland():
+            raise WaylandPortalError("Not a Wayland session")
+
+        dbus, DBusGMainLoop, _GLib = _require_dbus_and_glib()
+        DBusGMainLoop(set_as_default=True)
+
+        self.bus = dbus.SessionBus()
+        self._portal = self.bus.get_object(PORTAL_BUS, PORTAL_PATH)
+        self._sc = dbus.Interface(self._portal, SCREENCAP_IFACE)
+
+        # 1) CreateSession
+        create_req = self._sc.CreateSession(
+            {"session_handle_token": f"{app_id}_session"},
+            dbus_interface=SCREENCAP_IFACE,
+        )
+        create = _call_and_wait(self.bus, create_req, timeout_ms=timeout_ms)
+        self.session_handle = create["results"].get("session_handle")
+        if not self.session_handle:
+            raise WaylandPortalError("Portal did not return a session_handle")
+
+        # Keep a strong ref to the session object so the portal does not tear it down.
+        try:
+            self._session_obj = self.bus.get_object(PORTAL_BUS, self.session_handle)
+        except Exception:
+            self._session_obj = None
+
+        # 2) SelectSources (monitor + embedded cursor)
+        select_req = self._sc.SelectSources(
+            self.session_handle,
+            {
+                "types": dbus.UInt32(1),  # monitor
+                "multiple": False,
+                "cursor_mode": dbus.UInt32(2),  # embedded
+                "handle_token": f"{app_id}_select",
+            },
+            dbus_interface=SCREENCAP_IFACE,
+        )
+        _call_and_wait(self.bus, select_req, timeout_ms=timeout_ms)
+
+        # 3) Start (user accepts the screen-share dialog)
+        start_req = self._sc.Start(
+            self.session_handle,
+            "",
+            {"handle_token": f"{app_id}_start"},
+            dbus_interface=SCREENCAP_IFACE,
+        )
+        started = _call_and_wait(self.bus, start_req, timeout_ms=timeout_ms)
+
+        streams = started["results"].get("streams")
+        if not streams:
+            raise WaylandPortalError("Portal returned no streams")
+
+        self.node_id = int(streams[0][0])
+        self._active = True
+        print(f"[ezpeek] ScreenCast portal active, pipewire node={self.node_id}")
+        return self.node_id
+
+    def close(self) -> None:
+        if self.session_handle and self.bus:
+            try:
+                # Best-effort Close on the portal session
+                sess = self.bus.get_object(PORTAL_BUS, self.session_handle)
+                sess.Close(dbus_interface="org.freedesktop.portal.Session")
+            except Exception:
+                pass
+        self._active = False
+        self.node_id = None
+        self.session_handle = None
+        self._session_obj = None
+        self._sc = None
+        self._portal = None
+        self.bus = None
+
+
 def request_pipewire_node_id(app_id: str = "ezpeek") -> int:
-    if not _is_wayland():
-        raise WaylandPortalError("Not a Wayland session")
-
-    dbus, DBusGMainLoop, _GLib = _require_dbus_and_glib()
-
-    # Attach glib main loop so dbus signals work
-    DBusGMainLoop(set_as_default=True)
-
-    bus = dbus.SessionBus()
-    portal = bus.get_object(PORTAL_BUS, PORTAL_PATH)
-    sc = dbus.Interface(portal, SCREENCAP_IFACE)
-
-    # 1) CreateSession
-    create_req = sc.CreateSession(
-        {"session_handle_token": f"{app_id}_session"},
-        dbus_interface=SCREENCAP_IFACE,
-    )
-    create = _call_and_wait(bus, create_req)
-    session_handle = create["results"].get("session_handle")
-    if not session_handle:
-        raise WaylandPortalError("Portal did not return a session_handle")
-
-    # 2) SelectSources
-    select_req = sc.SelectSources(
-        session_handle,
-        {
-            "types": dbus.UInt32(1),  # monitor
-            "multiple": False,
-            "cursor_mode": dbus.UInt32(2),  # embedded cursor
-            "handle_token": f"{app_id}_select",
-        },
-        dbus_interface=SCREENCAP_IFACE,
-    )
-    _call_and_wait(bus, select_req)
-
-    # 3) Start
-    start_req = sc.Start(
-        session_handle,
-        "",
-        {"handle_token": f"{app_id}_start"},
-        dbus_interface=SCREENCAP_IFACE,
-    )
-    started = _call_and_wait(bus, start_req)
-
-    streams = started["results"].get("streams")
-    if not streams:
-        raise WaylandPortalError("Portal returned no streams")
-
-    node_id = int(streams[0][0])
-    return node_id
+    """
+    One-shot portal grant. Prefer ScreenCastSession when streaming, so the
+    session stays open for the whole host lifetime.
+    """
+    session = ScreenCastSession()
+    return session.start(app_id=app_id)
 
 
 # ==================== Remote Desktop (for input injection on pure Wayland) ====================

@@ -7,7 +7,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from .wayland_portal import request_pipewire_node_id, WaylandPortalError
+from .wayland_portal import request_pipewire_node_id, WaylandPortalError, ScreenCastSession
 
 
 @dataclass(frozen=True)
@@ -220,38 +220,42 @@ def build_capture_input_args(spec: CaptureSpec) -> list[str]:
                     "-i", str(node_id),
                 ]
 
-            # kmsgrab: native DRM/KMS capture, works on Wayland without X11 or PipeWire (requires video group often)
-            if _check_ffmpeg_kmsgrab_support():
-                device = _find_drm_device()
-                args = ["-f", "kmsgrab", "-framerate", fr]
-                # kmsgrab uses -i - for the primary plane; device can help on multi-GPU
-                if device:
-                    args += ["-device", device]
-                args += ["-i", "-"]
-                # Note: cursor inclusion is compositor-dependent; draw_mouse flag kept for consistency but may not apply
-                return args
+            # kmsgrab is opt-in: it often fails without CAP_SYS_ADMIN / correct DRM master
+            # ("No handle set on framebuffer") and previously blocked better fallbacks.
+            if os.environ.get("EZPEEK_USE_KMSGRAB", "").strip().lower() in ("1", "true", "yes"):
+                if _check_ffmpeg_kmsgrab_support():
+                    device = _find_drm_device()
+                    args = ["-f", "kmsgrab", "-framerate", fr]
+                    if device:
+                        args += ["-device", device]
+                    args += ["-i", "-"]
+                    return args
 
             if _has_wl_screenrec():
-                # wl-screenrec handled in build_sender_cmd (pipeline bypass)
-                raise RuntimeError("Use of wl-screenrec for capture should be handled upstream; install and retry.")
+                # wl-screenrec is handled in build_sender_cmd (pipeline bypass)
+                raise RuntimeError(
+                    "wl-screenrec is installed but was not selected by the sender builder; retry hosting."
+                )
 
-            raise RuntimeError(
-                "No supported native Wayland capture available.\n\n"
-                "Install one of (pure Wayland, no X11):\n"
-                "- FFmpeg built with PipeWire support (best for portal):\n"
-                "  Ubuntu: sudo apt install ffmpeg pipewire wireplumber xdg-desktop-portal-gnome\n"
-                "  (verify: ffmpeg -demuxers | grep -i pipewire)\n"
-                "- wl-screenrec (auto if present)\n"
-                "  Ubuntu/Arch: install wl-screenrec\n"
-                "- gstreamer with pipewiresrc (auto if present, used for capture + y4m)\n"
-                "  Usually: sudo apt install gstreamer1.0-pipewire gstreamer1.0-plugins-good\n"
-                "- kmsgrab (FFmpeg built-in, may need video group + compositor support)\n"
-                "  sudo usermod -aG video $USER && newgrp video\n\n"
-                "X11 fallbacks deliberately removed (Ubuntu 26.04+ etc. are Wayland-only)."
+            # Fall through to XWayland/x11grab if DISPLAY is available.
+            print(
+                "[ezpeek] No ffmpeg-native Wayland capture (no pipewire demuxer). "
+                "Will try XWayland x11grab if DISPLAY is set, or GStreamer/portal via HostService."
             )
 
-        # X11 path (only for real X11 or force)
-        if (spec.force_x11 or not is_wayland) and has_display:
+        # X11 / XWayland path.
+        # On pure Wayland with no working PipeWire capture, x11grab via XWayland is
+        # a last-resort fallback so hosting can still start (may miss pure-Wayland UI).
+        if has_display and (
+            spec.force_x11
+            or not is_wayland
+            or os.environ.get("EZPEEK_ALLOW_X11GRAB", "1") == "1"
+        ):
+            if is_wayland and not spec.force_x11:
+                print(
+                    "[ezpeek] Falling back to x11grab via XWayland (DISPLAY set). "
+                    "Prefer PipeWire portal capture when available."
+                )
             display = spec.display or os.environ.get("DISPLAY", ":0.0")
             size = spec.video_size or _x11_screen_size(display)
             args = ["-f", "x11grab", "-framerate", fr]
@@ -267,7 +271,12 @@ def build_capture_input_args(spec: CaptureSpec) -> list[str]:
         args = ["-f", "avfoundation", "-framerate", fr, "-i", "1"]  # 1 = screen, adjust as needed
         return args
 
-    raise RuntimeError("Unsupported capture environment. On Linux use native Wayland (PipeWire) or legacy X11. Pure Wayland is the target.")
+    raise RuntimeError(
+        "Unsupported capture environment.\n"
+        "Linux Wayland: need PipeWire portal (xdg-desktop-portal) + either\n"
+        "  ffmpeg with pipewire demuxer, wl-screenrec, or gstreamer pipewiresrc.\n"
+        "Or set DISPLAY for X11/XWayland x11grab fallback."
+    )
 
 
 def get_wayland_capture_command(spec: CaptureSpec, output_url: str) -> Tuple[str, list[str]]:

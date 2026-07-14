@@ -24,21 +24,38 @@ Production-oriented focus: excellent cross-platform capture (especially **Linux 
 - Linux only: `dbus-python`, `PyGObject` (for Wayland portal)
 - (Recommended) `xdotool` on Linux for input
 
-## Quick Start
+## Quick Start (Phase 1 — same LAN, no cloud server)
+
 ```bash
 # Install in editable mode
 pip install -e .
 
+# Verify this machine can stream + control (no second PC needed)
+ezpeek self-test
+
 # Run GUI
 ezpeek
-# or
-python -m ezpeek
+# Host without screen capture (synthetic pattern — useful for debugging):
+ezpeek --test-pattern
 ```
 
+### Two-machine checklist
+1. **Same network** (or same hypervisor LAN / bridged VM).
+2. Install on both machines (`pip install -e .`), FFmpeg with **SRT** + **ffplay** on PATH (or let ezpeek auto-download).
+3. **Firewall** (both sides): allow  
+   - UDP **27787** (discovery)  
+   - UDP **2734** (video / SRT)  
+   - TCP **2735** (control / input)
+4. Machine A: run `ezpeek` → press **H** (Linux Wayland: accept the screen-share portal). Status should show `HOSTING … ip:2734 ctrl:2735`.
+5. Machine B: wait until A appears with **video 2734** (not “not hosting”) → **double-click**.
+6. Video opens in an external **ffplay** window; the control window handles input — enable **Grab Input**.
+
+Logs: `~/.cache/ezpeek/logs/` (Linux) or `%LOCALAPPDATA%\ezpeek\logs\` (Windows).
+
 In GUI:
-1. On machine A press **H** (or use UI) to start **hosting**.
-2. On machine B the peer appears — double-click to view.
-3. In the ViewerWindow enable **"Grab Input"** to forward mouse/keyboard.
+1. On machine A press **H** (or **Start Hosting**) to start **hosting**.
+2. On machine B the peer appears with video ports — double-click to view.
+3. In the control window enable **"Grab Input"** to forward mouse/keyboard.
 
 ## Configuration / Advanced
 HostService supports:

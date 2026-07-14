@@ -7,13 +7,13 @@ from PySide6.QtWidgets import QApplication
 from .windows.main_window import MainWindow
 
 
-def run_gui(argv: list[str] | None = None) -> int:
+def run_gui(argv: list[str] | None = None, *, test_pattern: bool = False) -> int:
     if argv is None:
         argv = []
 
     app = QApplication(["ezpeek", *argv])
 
-    w = MainWindow()
+    w = MainWindow(test_pattern=test_pattern)
     w.show()
 
     return app.exec()

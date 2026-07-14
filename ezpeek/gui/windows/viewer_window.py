@@ -1,23 +1,20 @@
 """
-ViewerWindow - dedicated window for viewing a remote desktop + forwarding input.
+ViewerWindow - control surface for a remote session.
 
-Current design:
-- The video is launched externally via ViewerService (ffplay for best HW decode + low latency).
-- This window provides controls for input grabbing (mouse/keyboard forwarding).
-- When "Grab Input" is active, this window captures events and sends them over the control channel.
-- The separate ffplay window can be positioned/resized independently.
-
-Usage from MainWindow:
-    # main_window already does viewer.start(...) then:
-    w = ViewerWindow(ip, video_port, ctrl_port)
-    w.show()
+Video is launched externally via ViewerService (ffplay).
+This window owns the TCP control channel and optional input grab.
 """
 
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QCheckBox, QSpinBox
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QLabel,
+    QCheckBox,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeyEvent, QMouseEvent, QWheelEvent
@@ -26,59 +23,80 @@ from ...core.control import ControlClient
 
 
 class ViewerWindow(QMainWindow):
-    def __init__(self, host_ip: str, video_port: int, ctrl_port: int | None = None, parent=None):
+    def __init__(
+        self,
+        host_ip: str,
+        video_port: int,
+        ctrl_port: int | None = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.host_ip = host_ip
         self.video_port = video_port
         self.ctrl_port = ctrl_port
 
-        self.setWindowTitle(f"EzPeek Viewer — {host_ip}:{video_port}")
-        self.setMinimumSize(800, 500)
+        self.setWindowTitle(f"EzPeek Control — {host_ip}:{video_port}")
+        self.setMinimumSize(720, 420)
 
         self.control = ControlClient()
+        self.control_connected = False
         self._grab_input = False
-        self._last_mouse_pos = (0, 0)
 
         self._setup_ui()
 
         if ctrl_port:
-            if self.control.connect(host_ip, ctrl_port):
-                self.status_label.setText(f"Control connected to {host_ip}:{ctrl_port}")
+            self.control_connected = self.control.connect(host_ip, int(ctrl_port), timeout=4.0, retries=4)
+            if self.control_connected:
+                self.status_label.setText(
+                    f"Control connected to {host_ip}:{ctrl_port}\n"
+                    f"Video: separate ffplay window 'EzPeek Video - {host_ip}:{video_port}'\n"
+                    "Enable Grab Input to forward mouse/keyboard."
+                )
             else:
-                self.status_label.setText("Control connect failed (input disabled)")
-
-        # Note: The video is launched externally by the caller via ViewerService (ffplay).
-        # We just provide the control surface here.
+                self.status_label.setText(
+                    f"Control connect FAILED to {host_ip}:{ctrl_port}\n"
+                    f"Video may still work in ffplay.\n"
+                    f"Check host firewall (TCP {ctrl_port}) and that host is still hosting."
+                )
+        else:
+            self.status_label.setText(
+                "No control port advertised. Video only (if ffplay window appeared)."
+            )
 
     def _setup_ui(self):
         central = QWidget()
         layout = QVBoxLayout(central)
 
-        self.status_label = QLabel("Video launched externally in ffplay (for best performance).\nEnable 'Grab Input' below to control the remote from this window.\n\n[DEBUG] Check your terminal for [ezpeek viewer] logs (command, ffplay path, exit codes).")
+        self.status_label = QLabel("Connecting…")
         self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #ddd; font-size: 13px;")
 
-        # Controls
         ctrl_layout = QHBoxLayout()
 
         self.grab_cb = QCheckBox("Grab Input (send mouse/keyboard)")
         self.grab_cb.stateChanged.connect(self._toggle_grab)
 
-        self.btn_stop = QPushButton("Stop Viewing")
-        self.btn_stop.clicked.connect(self.close)
-
         self.btn_ping = QPushButton("Ping Control")
-        self.btn_ping.clicked.connect(lambda: self.control.send("PING") if self.ctrl_port else None)
+        self.btn_ping.clicked.connect(self._ping)
+
+        self.btn_reconnect = QPushButton("Reconnect Control")
+        self.btn_reconnect.clicked.connect(self._reconnect)
+
+        self.btn_stop = QPushButton("Close")
+        self.btn_stop.clicked.connect(self.close)
 
         ctrl_layout.addWidget(self.grab_cb)
         ctrl_layout.addStretch()
         ctrl_layout.addWidget(self.btn_ping)
+        ctrl_layout.addWidget(self.btn_reconnect)
         ctrl_layout.addWidget(self.btn_stop)
 
-        # Info / instructions
         info = QLabel(
-            "The actual video appears in a separate ffplay window (external for low latency + hardware decode).\n"
-            "Use this window to grab and forward input. Click inside after enabling grab. ESC to release.\n"
-            "If no ffplay window appears, look at the console where you launched ezpeek for debug logs."
+            "Video appears in a separate ffplay window (best latency + HW decode).\n"
+            "This window is only for remote input. ESC releases grab.\n"
+            "If no video window: check terminal logs and ~/.cache/ezpeek/logs (Linux) "
+            "or %LOCALAPPDATA%\\ezpeek\\logs (Windows)."
         )
         info.setStyleSheet("color:#888; font-size:11px;")
         info.setWordWrap(True)
@@ -88,17 +106,36 @@ class ViewerWindow(QMainWindow):
         layout.addWidget(info)
 
         self.setCentralWidget(central)
-
-        # Allow receiving keyboard even without focus on child widgets
         self.setFocusPolicy(Qt.StrongFocus)
-
-        # Track mouse in this window
         self.setMouseTracking(True)
+
+    def _ping(self):
+        if self.control.send("PING"):
+            self.status_label.setText(self.status_label.text().split("\n")[0] + "\nPing sent OK")
+        else:
+            self.status_label.setText("Ping failed — control not connected")
+
+    def _reconnect(self):
+        if not self.ctrl_port:
+            self.status_label.setText("No control port to reconnect")
+            return
+        self.control_connected = self.control.connect(
+            self.host_ip, int(self.ctrl_port), timeout=4.0, retries=4
+        )
+        if self.control_connected:
+            self.status_label.setText(f"Control reconnected to {self.host_ip}:{self.ctrl_port}")
+        else:
+            self.status_label.setText(f"Reconnect failed to {self.host_ip}:{self.ctrl_port}")
 
     def _toggle_grab(self, state: int):
         self._grab_input = bool(state)
         if self._grab_input:
-            self.grabMouse()  # Qt grab for better mouse capture while window focused
+            if not self.control_connected:
+                self.status_label.setText("Cannot grab — control is not connected")
+                self.grab_cb.setChecked(False)
+                self._grab_input = False
+                return
+            self.grabMouse()
             self.setFocus()
             self.status_label.setText("Input GRABBED — mouse & keys forwarded. ESC to release.")
         else:
@@ -108,42 +145,37 @@ class ViewerWindow(QMainWindow):
                 pass
             self.status_label.setText("Input released.")
 
-    # ---- Input forwarding ----
     def mouseMoveEvent(self, event: QMouseEvent):
         if self._grab_input and self.ctrl_port:
-            x = event.position().x()
-            y = event.position().y()
-            # Simple absolute mapping (user can scale on remote side if needed)
-            self.control.mouse_move(int(x), int(y))
+            pos = event.position()
+            self.control.mouse_move(int(pos.x()), int(pos.y()))
         super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent):
         if self._grab_input and self.ctrl_port:
-            btn = self._qt_button_to_num(event.button())
-            self.control.mouse_click(btn, down=True)
+            self.control.mouse_click(self._qt_button_to_num(event.button()), down=True)
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         if self._grab_input and self.ctrl_port:
-            btn = self._qt_button_to_num(event.button())
-            self.control.mouse_click(btn, down=False)
+            self.control.mouse_click(self._qt_button_to_num(event.button()), down=False)
         super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event: QWheelEvent):
         if self._grab_input and self.ctrl_port:
-            delta = event.angleDelta().y() // 120   # typical steps
+            delta = event.angleDelta().y() // 120
             if delta:
                 self.control.mouse_wheel(int(delta))
         super().wheelEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent):
         if self._grab_input and self.ctrl_port:
+            if event.key() == Qt.Key_Escape:
+                self.grab_cb.setChecked(False)
+                return
             key = self._qt_key_to_name(event)
             if key:
                 self.control.key(key, down=True)
-            if event.key() == Qt.Key_Escape:
-                self.grab_cb.setChecked(False)
-                self._toggle_grab(0)
         else:
             super().keyPressEvent(event)
 
@@ -155,7 +187,6 @@ class ViewerWindow(QMainWindow):
         else:
             super().keyReleaseEvent(event)
 
-    # Mappings
     def _qt_button_to_num(self, qt_btn) -> int:
         if qt_btn == Qt.LeftButton:
             return 1
@@ -168,8 +199,6 @@ class ViewerWindow(QMainWindow):
     def _qt_key_to_name(self, ev: QKeyEvent) -> str:
         key = ev.key()
         text = ev.text()
-
-        # Common special keys
         special = {
             Qt.Key_Return: "Return",
             Qt.Key_Enter: "Return",
@@ -194,11 +223,8 @@ class ViewerWindow(QMainWindow):
         }
         if key in special:
             return special[key]
-
         if text and len(text) == 1:
             return text.lower()
-
-        # Fallback to key name
         return ev.text().lower() or "space"
 
     def closeEvent(self, event):

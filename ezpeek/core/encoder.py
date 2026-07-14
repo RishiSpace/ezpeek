@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import os
 import platform
-import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import Literal, Optional
@@ -13,22 +13,28 @@ VideoCodec = Literal["h264", "hevc"]
 @dataclass(frozen=True)
 class EncodeSpec:
     codec: VideoCodec = "h264"
-    bitrate_kbps: int = 12000
-    fps: int = 60
-    gop: int = 60
+    bitrate_kbps: int = 6000
+    fps: int = 30
+    gop: int = 30
     width: Optional[int] = None
     height: Optional[int] = None
 
 
 def _ffmpeg() -> str:
     from .transport import _find_ffmpeg_executables
+
     path, _ = _find_ffmpeg_executables()
     return path
 
 
 def _ffmpeg_encoders_text() -> str:
     try:
-        p = subprocess.run([_ffmpeg(), "-hide_banner", "-encoders"], capture_output=True, text=True, check=False)
+        p = subprocess.run(
+            [_ffmpeg(), "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         return (p.stdout or "") + (p.stderr or "")
     except Exception:
         return ""
@@ -36,12 +42,15 @@ def _ffmpeg_encoders_text() -> str:
 
 def pick_hw_encoder(codec: VideoCodec) -> Optional[str]:
     """
-    Pick a hardware encoder if available in the installed ffmpeg build.
-    Platform-aware priority for best performance / compatibility:
-      - Windows: NVENC > AMF > QSV
-      - Linux: VAAPI > NVENC > QSV > AMF
-      - Fallback generic order
+    Pick a hardware encoder if available.
+
+    Phase 1 default is *software* encode (libx264). Many HW paths (especially
+    VAAPI/QSV) need device setup that was previously missing and caused hosts
+    to die immediately. Set EZPEEK_HW_ENCODE=1 to enable auto HW pick.
     """
+    if os.environ.get("EZPEEK_HW_ENCODE", "").strip().lower() not in ("1", "true", "yes", "on"):
+        return None
+
     txt = _ffmpeg_encoders_text()
     sys_name = platform.system().lower()
 
@@ -50,26 +59,26 @@ def pick_hw_encoder(codec: VideoCodec) -> Optional[str]:
     else:
         base = ["hevc_nvenc", "hevc_amf", "hevc_qsv", "hevc_vaapi"]
 
-    # Reorder by platform preference
     if sys_name == "windows":
         order = ["nvenc", "amf", "qsv", "vaapi"]
     elif sys_name == "linux":
-        order = ["vaapi", "nvenc", "qsv", "amf"]
+        # Prefer NVENC over VAAPI — VAAPI needs -vaapi_device + hwupload.
+        order = ["nvenc", "qsv", "amf", "vaapi"]
     else:
         order = ["nvenc", "amf", "qsv", "vaapi"]
 
-    cands = []
+    cands: list[str] = []
     for pref in order:
         for c in base:
             if pref in c and c not in cands:
                 cands.append(c)
-    # add any remaining
     for c in base:
         if c not in cands:
             cands.append(c)
 
     for enc in cands:
-        if enc in txt:
+        if enc in txt and not enc.endswith("_vaapi"):
+            # Skip bare VAAPI until we wire hw device context.
             return enc
     return None
 
@@ -112,8 +121,6 @@ def build_video_encode_args(spec: EncodeSpec) -> list[str]:
         args += ["-preset", "p1", "-tune", "ll", "-rc", "cbr", "-pix_fmt", "yuv420p"]
     elif hw.endswith("_qsv"):
         args += ["-preset", "veryfast", "-look_ahead", "0"]
-    elif hw.endswith("_vaapi"):
-        args += ["-pix_fmt", "nv12"]
     elif hw.endswith("_amf"):
         args += ["-usage", "lowlatency", "-rc", "cbr"]
 

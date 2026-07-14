@@ -1,5 +1,26 @@
 import ipaddress
+import os
 import socket
+import tempfile
+from pathlib import Path
+
+
+def get_log_dir() -> Path:
+    """Cross-platform directory for ezpeek runtime logs."""
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    path = base / "ezpeek" / "logs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_temp_dir() -> Path:
+    """Writable temp dir (works on Windows and Linux)."""
+    path = Path(tempfile.gettempdir()) / "ezpeek"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def _iter_local_ipv4_candidates():
