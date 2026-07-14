@@ -23,6 +23,20 @@ from typing import Callable, Optional
 from .input_controller import InputController
 
 
+def _low_latency_tcp(sock: socket.socket) -> None:
+    """Disable Nagle and prefer immediate send for remoting input."""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    # Linux: ACK without delayed-ack wait when available
+    if hasattr(socket, "TCP_QUICKACK"):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)  # type: ignore[attr-defined]
+        except OSError:
+            pass
+
+
 class ControlServer:
     """
     Runs on the HOST side. Listens for control connections and applies input locally.
@@ -57,7 +71,7 @@ class ControlServer:
         self._running = True
         self._thread = threading.Thread(target=self._accept_loop, daemon=True, name="ezpeek-ctrl-accept")
         self._thread.start()
-        print(f"[ezpeek-control] Server listening on {self.host}:{self.port}")
+        print(f"[ezpeek-control] Server listening on {self.host}:{self.port} (TCP_NODELAY clients)")
         return self.port
 
     def stop(self):
@@ -80,6 +94,7 @@ class ControlServer:
             try:
                 self._sock.settimeout(1.0)
                 client, addr = self._sock.accept()
+                _low_latency_tcp(client)
                 client.settimeout(300.0)
                 self._clients.append(client)
                 print(f"[ezpeek-control] Client connected from {addr}")
@@ -190,11 +205,12 @@ class ControlClient:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(timeout)
                 sock.connect((host, port))
+                _low_latency_tcp(sock)
                 # Keepalive-ish: longer idle timeout for remoting sessions
                 sock.settimeout(None)
                 self._sock = sock
                 self._connected = True
-                print(f"[ezpeek-control] Connected to {host}:{port} (attempt {attempt})")
+                print(f"[ezpeek-control] Connected to {host}:{port} (attempt {attempt}, NODELAY)")
                 return True
             except Exception as e:
                 last_err = e

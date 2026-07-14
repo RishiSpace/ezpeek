@@ -220,6 +220,7 @@ class RelayHostAgent:
             f"(source {src})"
         )
         sock = socket.create_connection((self.relay_host, self.relay_port), timeout=20)
+        _low_latency_tcp(sock)
         sock.settimeout(120)
         sock.sendall(f"HOST {self.token} {self.channel}\n".encode())
         line = _recv_line(sock)
@@ -433,6 +434,7 @@ class RelayViewerTunnel:
                 continue
             try:
                 remote = socket.create_connection((self.relay_host, self.relay_port), timeout=20)
+                _low_latency_tcp(remote)
                 remote.sendall(
                     f"VIEW {self.token} {self.friend_username} {self.channel}\n".encode()
                 )
@@ -463,8 +465,22 @@ def _recv_line(sock: socket.socket) -> str:
     return buf.decode("utf-8", errors="ignore").strip()
 
 
+def _low_latency_tcp(sock: socket.socket) -> None:
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    if hasattr(socket, "TCP_QUICKACK"):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)  # type: ignore[attr-defined]
+        except OSError:
+            pass
+
+
 def _pipe_sockets(a: socket.socket, b: socket.socket):
     stop = threading.Event()
+    _low_latency_tcp(a)
+    _low_latency_tcp(b)
 
     def one_way(src, dst):
         try:
