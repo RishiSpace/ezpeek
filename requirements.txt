@@ -5,6 +5,8 @@
 PySide6>=6.5
 zeroconf>=0.80
 
+# Cloud auth / friends (stdlib urllib used; no extra client dep required)
+
 # Linux-specific dependencies (Wayland portal + dbus for screen sharing/input)
 dbus-python>=1.3.2; platform_system == "Linux"
 PyGObject>=3.42; platform_system == "Linux"
