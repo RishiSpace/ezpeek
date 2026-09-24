@@ -1,0 +1,31 @@
+[package]
+name = "ezpeek-host"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ezpeek-host"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+ezpeek-core = { workspace = true }
+ezpeek-capture = { workspace = true }
+ezpeek-encode = { workspace = true }
+ezpeek-transport = { workspace = true }
+ezpeek-handshake = { workspace = true }
+ezpeek-input = { workspace = true }
+ezpeek-synthetic = { path = "../../tests/synthetic" }
+
+[dependencies.tokio]
+version = "1"
+optional = true
+features = ["rt"]
+
+[features]
+default = ["nvenc", "x264-fallback"]
+nvenc = ["ezpeek-encode/nvenc"]
+vaapi = ["ezpeek-encode/vaapi"]
+x264-fallback = ["ezpeek-encode/x264-fallback"]
+pipewire-capture = ["ezpeek-capture/pipewire-capture"]
+portal = ["ezpeek-capture/portal", "dep:tokio"]

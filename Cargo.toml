@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ezpeek-core",
+    "crates/ezpeek-capture",
+    "crates/ezpeek-encode",
+    "crates/ezpeek-decode",
+    "crates/ezpeek-transport",
+    "crates/ezpeek-handshake",
+    "crates/ezpeek-input",
+    "crates/ezpeek-present",
+    "crates/ezpeek-gui",
+    "bin/ezpeek-host",
+    "bin/ezpeek-viewer",
+    "bin/ezpeek-rendezvous",
+    "tests/synthetic",
+    "tests/integration",
+    "tests/bench",
+]
+
+[workspace.dependencies]
+ezpeek-core = { path = "crates/ezpeek-core" }
+ezpeek-capture = { path = "crates/ezpeek-capture" }
+ezpeek-encode = { path = "crates/ezpeek-encode" }
+ezpeek-decode = { path = "crates/ezpeek-decode" }
+ezpeek-transport = { path = "crates/ezpeek-transport" }
+ezpeek-handshake = { path = "crates/ezpeek-handshake" }
+ezpeek-input = { path = "crates/ezpeek-input" }
+ezpeek-present = { path = "crates/ezpeek-present" }
+ezpeek-gui = { path = "crates/ezpeek-gui" }
+ezpeek-synthetic = { path = "tests/synthetic" }
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1

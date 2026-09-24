@@ -1,0 +1,15 @@
+[package]
+name = "ezpeek-integration"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ezpeek-core = { workspace = true }
+ezpeek-transport = { workspace = true }
+ezpeek-handshake = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+hw-tests = []
+webrtc-loopback = ["ezpeek-transport/webrtc-peer"]
+turn-relay-probe = []

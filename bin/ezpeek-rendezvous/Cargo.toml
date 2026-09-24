@@ -1,0 +1,23 @@
+[package]
+name = "ezpeek-rendezvous"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ezpeek-rendezvous"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+ezpeek-handshake = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+turn = { version = "0.6", optional = true }
+webrtc-util = { version = "0.7", optional = true }
+
+[features]
+turn-relay = ["dep:turn", "dep:webrtc-util"]

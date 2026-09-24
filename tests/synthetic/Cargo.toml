@@ -1,0 +1,11 @@
+[package]
+name = "ezpeek-synthetic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ezpeek-core = { workspace = true }
+ezpeek-capture = { workspace = true }
+ezpeek-encode = { workspace = true }
+ezpeek-decode = { workspace = true }
+thiserror = { workspace = true }

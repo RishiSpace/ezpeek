@@ -1,0 +1,23 @@
+[package]
+name = "ezpeek-bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ezpeek-bench"
+path = "src/main.rs"
+
+[dependencies]
+ezpeek-core = { workspace = true }
+ezpeek-capture = { workspace = true }
+ezpeek-encode = { workspace = true }
+ezpeek-decode = { workspace = true }
+ezpeek-transport = { workspace = true }
+ezpeek-synthetic = { workspace = true }
+anyhow = { workspace = true }
+
+[features]
+nvenc = ["ezpeek-encode/nvenc"]
+x264-fallback = ["ezpeek-encode/x264-fallback"]
+openh264-fallback = ["ezpeek-decode/openh264-fallback"]
+default = ["x264-fallback", "openh264-fallback"]

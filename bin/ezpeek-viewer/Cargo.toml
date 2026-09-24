@@ -1,0 +1,26 @@
+[package]
+name = "ezpeek-viewer"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ezpeek-viewer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+ezpeek-core = { workspace = true }
+ezpeek-capture = { workspace = true }
+ezpeek-decode = { workspace = true }
+ezpeek-present = { workspace = true }
+ezpeek-transport = { workspace = true }
+ezpeek-handshake = { workspace = true }
+ezpeek-input = { workspace = true }
+ezpeek-synthetic = { path = "../../tests/synthetic" }
+ezpeek-encode = { path = "../../crates/ezpeek-encode" }
+
+[features]
+default = ["software"]
+software = ["ezpeek-decode/openh264-fallback", "ezpeek-present/software-present"]
+nvenc = ["ezpeek-encode/nvenc"]
+webrtc-peer = ["ezpeek-transport/webrtc-peer"]

@@ -1,0 +1,30 @@
+[package]
+name = "ezpeek-capture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ezpeek-core = { workspace = true }
+thiserror = { workspace = true }
+
+[dependencies.pipewire]
+version = "0.10"
+optional = true
+
+[dependencies.libc]
+version = "0.2"
+optional = true
+
+[dependencies.ashpd]
+version = "0.13"
+optional = true
+default-features = false
+features = ["screencast", "tokio"]
+
+[dependencies.tokio]
+version = "1"
+optional = true
+
+[features]
+pipewire-capture = ["dep:pipewire", "dep:libc"]
+portal = ["dep:ashpd", "dep:tokio", "pipewire-capture"]

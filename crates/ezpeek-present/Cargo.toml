@@ -1,0 +1,13 @@
+[package]
+name = "ezpeek-present"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ezpeek-core = { workspace = true }
+thiserror = { workspace = true }
+openh264 = { version = "0.9", optional = true }
+minifb = { version = "0.28", optional = true }
+
+[features]
+software-present = ["dep:openh264", "dep:minifb"]

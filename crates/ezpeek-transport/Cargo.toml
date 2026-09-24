@@ -1,0 +1,16 @@
+[package]
+name = "ezpeek-transport"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ezpeek-core = { workspace = true }
+ezpeek-handshake = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+webrtc = { version = "0.8", optional = true }
+
+[features]
+webrtc-peer = ["dep:webrtc"]

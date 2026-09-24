@@ -1,0 +1,14 @@
+[package]
+name = "ezpeek-decode"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ezpeek-core = { workspace = true }
+ezpeek-encode = { workspace = true }
+thiserror = { workspace = true }
+openh264 = { version = "0.9", optional = true }
+
+[features]
+software-fallback = []
+openh264-fallback = ["dep:openh264"]

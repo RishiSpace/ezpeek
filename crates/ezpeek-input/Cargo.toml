@@ -1,0 +1,14 @@
+[package]
+name = "ezpeek-input"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ezpeek-core = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+evdev = { version = "0.13", optional = true }
+
+[features]
+uinput = ["dep:evdev"]

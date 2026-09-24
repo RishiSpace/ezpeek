@@ -1,0 +1,37 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  check-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: sudo apt-get update && sudo apt-get install -y libx264-dev libva-dev libpipewire-0.3-dev
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p ezpeek-encode --all-targets --features vaapi -- -D warnings
+      - run: cargo clippy -p ezpeek-encode --all-targets --features x264-fallback -- -D warnings
+      - run: cargo clippy -p ezpeek-capture --all-targets --features pipewire-capture -- -D warnings
+      - run: cargo clippy -p ezpeek-decode --all-targets --features openh264-fallback -- -D warnings
+      - run: cargo clippy -p ezpeek-transport --all-targets --features webrtc-peer -- -D warnings
+      - run: cargo test --workspace
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+  check-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace

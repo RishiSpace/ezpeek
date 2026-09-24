@@ -1,0 +1,33 @@
+[package]
+name = "ezpeek-encode"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ezpeek-core = { workspace = true }
+thiserror = { workspace = true }
+
+[dependencies.x264]
+version = "0.5"
+optional = true
+
+[dependencies.libva]
+version = "0.1"
+optional = true
+
+[dependencies.moq-nvenc]
+version = "0.0.5"
+optional = true
+
+[dependencies.cudarc]
+version = "0.19"
+optional = true
+default-features = false
+features = ["driver", "fallback-dynamic-loading", "cuda-12020"]
+
+[features]
+software-fallback = []
+x264-fallback = ["dep:x264"]
+ffmpeg-hw = []
+vaapi = ["dep:libva"]
+nvenc = ["dep:moq-nvenc", "dep:cudarc"]
